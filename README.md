@@ -8,6 +8,14 @@
 |:-:|:-:|:-:|:-:|:-:|
 | ![选单](docs/hub.jpg) | ![瞄准训练](docs/aim.jpg) | ![架枪训练](docs/hold.jpg) | ![架枪结算](docs/hold-result.jpg) | ![灵敏度设置](docs/sensitivity.jpg) |
 
+## 创作动机
+
+CN FPS 的惨状大家有目共睹：瓦罗兰特上海冠军赛，CN 队伍一胜难求；CN CS 的处境，甚至还不如 CN 瓦。
+
+为了 CN FPS 的崛起，我把目光投向了一群人——程序员。他们是每天坐在电脑前时间最长的人，鼠标就在手边，而且现在多了大把「等模型回复」的空档：看着智能体思考、跑命令、改代码，干等着也是等着。
+
+于是有了 ForCNFps：在 DeepSeek Harness 的右侧栏里，用这些无聊的碎片时间磨练准星、反应和架枪的基本功。也许有朝一日，真能为 CN FPS 作出一点贡献。
+
 ## 三个游戏
 
 - **舒尔特斩**：舒尔特方格做成的动作游戏，按 1→N 的顺序点敌兵，火柴人冲过去斩杀，连斩越高招式越帅。练注意力和视觉搜索。
@@ -95,6 +103,8 @@ client.js           打包产物，已提交，方便直接从 GitHub 安装
 ---
 
 ### English
+
+**Why:** Chinese FPS esports has been having a rough time — wins are hard to come by for CN teams on the Valorant and CS world stages. Programmers spend more hours at a computer than almost anyone, and AI agents now hand them plenty of idle seconds waiting for replies. ForCNFps turns those seconds into aim, reaction and angle-holding practice — a small bet on the rise of CN FPS.
 
 **ForCNFps** is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that adds a pixel-art FPS warm-up arcade to the right sidebar, so you can practice while the agent works. It includes a Schulte-grid slasher, an Aim Lab–style Gridshot trainer, and a CS-style angle-holding trainer that scores stability, reaction time and headshot rate. A sensitivity page converts your mouse DPI and CS2/Valorant sensitivity into eDPI and cm/360, and uses Pointer Lock (raw input when available) so crosshair movement matches your in-game feel.
 
