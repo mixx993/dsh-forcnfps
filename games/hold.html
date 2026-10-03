@@ -21,7 +21,8 @@
 (() => {
   const { C, RM, B4, store, json, btext, btextW, ctext, icon, ring, panel, button, inRect, audio } = PK
   const KEY_BEST = 'hold-angle-best-v1'
-  const SLOW = /[?&]slow/.test(location.search)          // 调试：地址带 ?slow 时敌人反应时间 ×10，并暴露 window.__hold()
+  const SLOW = /[?&]slow/.test(location.search)          // 调试：地址带 ?slow 时敌人反应时间 ×10
+  const DEBUG = SLOW || /[?&]debug/.test(location.search) // 调试：?slow 或 ?debug 时暴露 window.__hold()
   const SLIDE = 90                                         // 敌人探出用时（毫秒），分 3 步
   const ttkFor = kills => Math.max(300, 650 - kills * 25) * (SLOW ? 10 : 1)   // 敌人反应时间：露头后多久打死你
   const ZONE = 3                                           // 架点判定半径（美术像素）
@@ -390,7 +391,7 @@
   // ---------- 状态 ----------
   let state = 'ready'           // ready | play | dying | over
   let phase = 'place'           // place | hold | peek | after
-  let rd = null, kills = 0, score = 0, heads = 0, rts = [], stabs = []
+  let rd = null, kills = 0, score = 0, heads = 0, rts = [], stabs = [], log = []   // log：每个击杀的明细，上传排行榜时给机器人重算分数
   let hp = 100, clip = 30, reserve = 90, reloadAt = 0, spread = 0, lastShot = 0, insideSince = 0
   let fx = [], decals = [], feed = [], shells = [], result = null, btnRect = null, muteRect = null, exitRect = null
   let lastAngle = [], dmgAt = 0, sway = { x: 0, y: 0 }, camPrev = { x: 0, y: 0 }
@@ -406,7 +407,7 @@
   function start() {
     const now = performance.now()
     state = 'play'
-    kills = score = heads = 0; rts = []; stabs = []
+    kills = score = heads = 0; rts = []; stabs = []; log = []
     hp = 100; clip = 30; reserve = 90; reloadAt = 0; spread = 0
     fx = []; decals = []; feed = []; shells = []; lastAngle = []
     newRound(now)
@@ -432,6 +433,7 @@
     kills++; if (part === 'head') heads++
     rts.push(rt)
     score += 100 + (part === 'head' ? 50 : 0) + R(Math.max(0, (rd.ttk - rt) / rd.ttk) * 100) + R((rd.stab || 0) / 2)
+    log.push({ rt, ttk: rd.ttk, head: part === 'head' ? 1 : 0, stab: rd.stab || 0 })
     feed.unshift({ t: now, killer: 'YOU', victim: 'T', hs: part === 'head', mine: true })
     phase = 'after'; rd.afterAt = now
   }
@@ -446,9 +448,9 @@
   function end() {
     state = 'over'
     const best = json(KEY_BEST)
-    const isRec = kills > 0 && (!best || score > best.score)
+    const isRec = kills > 0 && (!best || kills > (best.kills || 0) || (kills === best.kills && score > best.score))   // 先比击杀，再比分数
     const rank = rankOf(kills)
-    if (isRec) store.set(KEY_BEST, JSON.stringify({ score, kills, rank: rank[1] }))
+    if (isRec) store.set(KEY_BEST, JSON.stringify({ score, kills, rank: rank[1], rounds: log, at: Date.now() }))
     result = {
       kills, score, rank, isRec, best, at: performance.now(), cause: rd.cause, ttk: rd.ttk,
       rt: rts.length ? R(rts.reduce((a, b) => a + b, 0) / rts.length) : 0,
@@ -791,7 +793,7 @@
     requestAnimationFrame(frame)
   }
 
-  if (SLOW) window.__hold = () => ({ state, phase, rd, cam: { ...cam }, kills, hp, clip, spread, markerOf, angleGeo, enemyFx, tParts, W, H })
+  if (DEBUG) window.__hold = () => ({ state, phase, rd, cam: { ...cam }, kills, hp, clip, spread, markerOf, angleGeo, enemyFx, tParts, W, H })
   addEventListener('resize', layout)
   layout()
   P.center()

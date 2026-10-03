@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ForCNFps</title>
 <!-- ForCNFps 选单：三张像素卡片，点一张就通知外层（DSH 插件）切到那个游戏，单独打开时直接跳到对应页面；
-     下面一条是灵敏度设置（鼠标 DPI + CS2/瓦罗兰特灵敏度，换算 eDPI、cm/360 和另一款游戏的等效值）。底层工具在 pixelkit.js。 -->
+     下面是灵敏度设置（鼠标 DPI + CS2/瓦罗兰特灵敏度，换算 eDPI、cm/360 和另一款游戏的等效值）和线上排行榜（GitHub）。
+     地址带 ?board=<url> 时从这个地址读榜单，方便本地测试。底层工具在 pixelkit.js。 -->
 <style>
   * { margin:0; padding:0; }
   html, body { height:100%; background:#1a1c2c; overflow:hidden; user-select:none; -webkit-user-select:none; }
@@ -23,10 +24,71 @@
   let stars = [], cards = [], hover = null, muteRect = null
 
   const GAMES = [
-    { id: 'schulte', title: '舒尔特斩', sub: 'SCHULTE', thumb: thumbSchulte },
-    { id: 'aim', title: '瞄准训练', sub: 'AIM TRAINER', thumb: thumbAim, best: () => json('aim-dots-best-v1') },
-    { id: 'hold', title: '架枪训练', sub: 'HOLD ANGLE', thumb: thumbHold, best: () => json('hold-angle-best-v1') },
+    { id: 'schulte', title: '舒尔特斩', sub: 'SCHULTE', thumb: thumbSchulte, best: () => { const m = myBest('schulte'); return m && m.show } },
+    { id: 'aim', title: '瞄准训练', sub: 'AIM TRAINER', thumb: thumbAim, best: () => { const b = json('aim-dots-best-v1'); return b && `${b.score}` } },
+    { id: 'hold', title: '架枪训练', sub: 'HOLD ANGLE', thumb: thumbHold, best: () => { const b = json('hold-angle-best-v1'); return b && (b.kills != null ? `${b.kills} KILLS` : `${b.score}`) } },
   ]
+
+  // ---------- 线上排行榜（GitHub）：榜单是仓库里的 leaderboard.json；上传 = 打开一个填好成绩的新建 Issue，由 Actions 机器人审核入榜 ----------
+  const REPO = 'mixx993/dsh-forcnfps'
+  const BOARD_URL = new URLSearchParams(location.search).get('board') || `https://raw.githubusercontent.com/${REPO}/main/leaderboard.json`
+  const MARK = '<!-- forcnfps-score -->'
+  const TABS = [['schulte', '舒尔特', '5X5 · TIME'], ['aim', '瞄准', 'SCORE'], ['hold', '架枪', 'KILLS']]
+  let board = { status: 'idle', data: null }, boardTab = 'hold', notice = null
+
+  function loadBoard() {
+    board = { status: 'loading', data: board.data }
+    fetch(BOARD_URL + (BOARD_URL.includes('?') ? '&' : '?') + 't=' + Math.floor(Date.now() / 60000))
+      .then(r => { if (!r.ok) throw new Error(r.status); return r.json() })
+      .then(d => { board = { status: 'ok', data: d } })
+      .catch(() => { board = { status: 'fail', data: board.data } })
+  }
+  // 本机最好成绩 + 上传用的数据（老版本存的纪录没有明细，不能上传）
+  function myBest(game) {
+    if (game === 'aim') {
+      const b = json('aim-dots-best-v1')
+      if (!b) return null
+      if (!Array.isArray(b.seq)) return { old: true, show: `${b.score}` }
+      return { show: `${b.score}`, title: `瞄准训练 ${b.score} 分`, payload: { v: 1, game, score: b.score, seq: b.seq } }
+    }
+    if (game === 'hold') {
+      const b = json('hold-angle-best-v1')
+      if (!b) return null
+      if (!Array.isArray(b.rounds)) return { old: true, show: `${b.kills || 0} KILLS` }
+      return { show: `${b.kills} KILLS`, title: `架枪训练 ${b.kills} 杀 · ${b.score} 分`, payload: { v: 1, game, score: b.score, rounds: b.rounds } }
+    }
+    // 舒尔特斩：从它自己的本机排行里找 5×5 最快的一局
+    const boards = json('schulte-slash-board-v1') || {}
+    let best = null, win = null
+    for (const [k, bd] of Object.entries(boards)) {
+      if (!k.startsWith('5-') || !bd || !Array.isArray(bd.runs)) continue
+      for (const r of bd.runs) if (r && r.time > 0 && (!best || r.time < best.time)) { best = r; win = k.slice(2) }
+    }
+    if (!best) return null
+    const t = Math.round(best.time * 100) / 100
+    return { show: `${t.toFixed(2)}S`, title: `舒尔特斩 5×5 ${t.toFixed(2)} 秒`, payload: { v: 1, game, n: 5, win, time: t, score: best.score, rank: best.rank } }
+  }
+  function issueUrl(mb) {
+    const body = `${MARK}\n**${mb.title}**\n\n这条 Issue 由 ForCNFps 插件生成。直接点下面的 **Submit new issue** 就行，机器人会自动审核并更新排行榜（大约 1 分钟）。请不要改动下面的数据。\n\n\`\`\`json\n${JSON.stringify(mb.payload)}\n\`\`\`\n`
+    return `https://github.com/${REPO}/issues/new?title=${encodeURIComponent('[ForCNFps] ' + mb.title)}&body=${encodeURIComponent(body)}`
+  }
+  // 嵌在插件里时让外层页面打开链接（小窗口不允许弹窗）；打不开就复制到剪贴板
+  function openUrl(url) {
+    notice = { kind: 'opening', at: performance.now(), url }
+    if (window.parent !== window) window.parent.postMessage({ type: 'dsh-arcade:open-url', url }, '*')
+    else notice.kind = window.open(url, '_blank') ? 'opened' : 'copy'
+    if (notice.kind === 'copy') copyUrl(url)
+  }
+  function copyUrl(url) {
+    const done = ok => { notice = { kind: ok ? 'copied' : 'failed', at: performance.now() } }
+    try { navigator.clipboard.writeText(url).then(() => done(true), () => done(false)) } catch (e) { done(false) }
+  }
+  addEventListener('message', e => {
+    const d = e.data
+    if (e.source !== window.parent || !d || d.type !== 'dsh-arcade:open-url-result' || !notice) return
+    if (d.ok) notice = { kind: 'opened', at: performance.now() }
+    else copyUrl(notice.url)
+  })
 
   // ---------- 24×24 缩略图 ----------
   function thumbSchulte(x, y) {
@@ -101,7 +163,7 @@
 
   function drawMenu(now, cx) {
     const cw = Math.min(S.W - 12, 124), ch = 34, gap = 6
-    const total = 50 + GAMES.length * (ch + gap) + 24
+    const total = 50 + GAMES.length * (ch + gap) + 48
     let y = Math.max(4, Math.floor((S.H - total) / 2) - 6)
     ctext('ForCNFps', cx, y, C.gold, { align: 'center', size: 16, bold: true, shadow: C.red })
     btext('FPS TRAINING ARCADE', cx, y + 22, C.slate, 1, 'center')
@@ -120,8 +182,8 @@
       btext(game.sub, r.x + 35, r.y + 22, C.slate)
       const best = game.best && game.best()
       if (best) {
-        btext(best.score, r.x + r.w - 6, r.y + 22, C.gold, 1, 'right')
-        icon('star', r.x + r.w - 15 - PK.btextW(best.score), r.y + 21, C.gold)
+        btext(best, r.x + r.w - 6, r.y + 22, C.gold, 1, 'right')
+        icon('star', r.x + r.w - 15 - PK.btextW(best), r.y + 21, C.gold)
       }
       btext('>', r.x + r.w - 8, r.y + 9, on ? C.gold : C.slate)
       return r
@@ -136,6 +198,76 @@
     btext(v.on ? `${SENS.games[v.game].short} ${v.value} · ${v.dpi}` : 'OFF', r.x + r.w - 13, r.y + 8, v.on ? C.fog : C.slate, 1, 'right')
     btext('>', r.x + r.w - 8, r.y + 8, on ? C.gold : C.slate)
     cards.push(r)
+
+    // 排行榜入口
+    const rb = { x, y: r.y + 24, w: cw, h: 20, id: 'board' }, onB = hover === 'board'
+    panel(rb.x, rb.y, rb.w, rb.h, onB ? C.gold : C.dusk)
+    icon(['#######', '#.###.#', '.#####.', '..###..', '...#...', '..###..', '.#####.'], rb.x + 5, rb.y + 6, C.gold)
+    ctext('排行榜', rb.x + 16, rb.y + 3, onB ? C.gold : C.white)
+    btext('GITHUB', rb.x + rb.w - 13, rb.y + 8, C.slate, 1, 'right')
+    btext('>', rb.x + rb.w - 8, rb.y + 8, onB ? C.gold : C.slate)
+    cards.push(rb)
+  }
+
+  // ---------- 排行榜页 ----------
+  function smallBtn(x, y, label) {
+    const w = 40, h = 14
+    g.fillStyle = C.dusk; g.fillRect(x + 1, y, w - 2, h); g.fillRect(x, y + 1, w, h - 2)
+    g.fillStyle = C.ink; g.fillRect(x + 1, y + 1, w - 2, h - 2)
+    btext('<', x + 4, y + 5, C.fog)
+    ctext(label, x + 10, y + 1, C.fog)
+    return { x, y, w, h }
+  }
+  function drawBoard(now, cx) {
+    ui = {}
+    const pw = Math.min(S.W - 12, 124), px = Math.floor((S.W - pw) / 2)
+    let y = Math.max(20, Math.floor((S.H - 236) / 2))
+    ui.back = smallBtn(3, 3, '返回')
+    ctext('排行榜', cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
+    btext('LEADERBOARD · GITHUB', cx, y + 21, C.slate, 1, 'center')
+    y += 32
+    const tw = Math.floor((pw - 4) / 3)
+    TABS.forEach(([id, label], i) => {
+      const r = { x: px + i * (tw + 2), y, w: tw, h: 16 }, on = boardTab === id
+      ui['tab_' + id] = r
+      g.fillStyle = on ? C.orange : C.dusk; g.fillRect(r.x, r.y, r.w, r.h)
+      if (on) { g.fillStyle = C.gold; g.fillRect(r.x, r.y, r.w, 1) }
+      ctext(label, r.x + Math.floor(r.w / 2), r.y + 1, on ? C.ink : C.fog, { align: 'center' })
+    })
+    y += 20
+    const tab = TABS.find(t => t[0] === boardTab)
+    btext('#  PLAYER', px + 1, y, C.slate); btext(tab[2], px + pw - 1, y, C.slate, 1, 'right')
+    y += 8
+    g.fillStyle = C.dusk; g.fillRect(px, y, pw, 1)
+    y += 3
+    const list = (board.data && board.data.boards && board.data.boards[boardTab]) || []
+    if (board.status === 'loading' && !board.data) ctext('加载中…', cx, y + 40, C.slate, { align: 'center' })
+    else if (board.status === 'fail' && !board.data) ctext('榜单加载失败', cx, y + 40, C.orange, { align: 'center' })
+    else if (!list.length) ctext('还没有人上榜', cx, y + 40, C.slate, { align: 'center' })
+    list.slice(0, 10).forEach((e, i) => {
+      const ry = y + i * 10
+      if (i % 2) { g.fillStyle = C.ink; g.fillRect(px, ry - 2, pw, 10) }
+      btext(i + 1, px + 1, ry, i < 3 ? C.gold : C.fog)
+      btext(String(e.user).toUpperCase().slice(0, 13), px + 12, ry, i < 3 ? C.white : C.fog)
+      const val = boardTab === 'hold' ? `${e.kills}` : boardTab === 'aim' ? `${e.score}` : `${Number(e.time).toFixed(2)}S`
+      btext(val, px + pw - 1, ry, i < 3 ? C.gold : C.white, 1, 'right')
+    })
+    y += 104
+    g.fillStyle = C.dusk; g.fillRect(px, y - 3, pw, 1)
+    const mb = myBest(boardTab)
+    ctext('我的最佳', px, y, C.fog)
+    btext(mb ? mb.show : '--', px + pw, y + 4, C.gold, 1, 'right')
+    y += 17
+    if (mb && mb.payload) ui.upload = PK.button(px, y, pw, '上传我的最佳')
+    else ctext(mb ? '旧纪录没有明细，再打一局' : '先去玩一局', cx, y + 2, C.slate, { align: 'center' })
+    y += 23
+    const age = notice ? now - notice.at : Infinity
+    const msg = !notice || age > 12000 ? null
+      : notice.kind === 'opening' ? ['正在打开 GitHub…']
+        : notice.kind === 'opened' ? ['在 GitHub 页面点提交', '约 1 分钟后上榜']
+          : notice.kind === 'copied' ? ['链接已复制', '粘到浏览器打开再提交']
+            : ['打不开链接，换浏览器试试']
+    if (msg) msg.forEach((t, i) => ctext(t, cx, y + i * 14, C.lime, { align: 'center' }))
   }
 
   // 画布上的输入框：数字用点阵字，聚焦时金色边框 + 闪烁光标；刚聚焦时整段高亮，第一下按键直接替换
@@ -210,6 +342,7 @@
     g.fillStyle = C.ink; g.fillRect(0, 0, S.W, S.H)
     PK.drawStars(stars, now)
     if (view === 'menu') drawMenu(now, cx)
+    else if (view === 'board') drawBoard(now, cx)
     else drawSens(now, cx)
     muteRect = PK.muteButton(S.W, S.H)
     S.present()
@@ -246,10 +379,18 @@
       else if (hit === 'done') { commit(); view = 'menu'; audio.note(7, 0.05) }
       return
     }
+    if (view === 'board') {
+      const hit = Object.keys(ui).find(k => inRect(p.x, p.y, ui[k]))
+      if (hit === 'back') { view = 'menu'; notice = null; audio.note(7, 0.05) }
+      else if (hit && hit.startsWith('tab_')) { boardTab = hit.slice(4); notice = null; audio.note(7, 0.04) }
+      else if (hit === 'upload') { const mb = myBest(boardTab); if (mb && mb.payload) { audio.arp([0, 7, 12], 0.04); openUrl(issueUrl(mb)) } }
+      return
+    }
 
     const r = cardAt(p)
     if (!r) return
     if (r.id === 'sens') { openSens(); audio.note(7, 0.04); return }
+    if (r.id === 'board') { view = 'board'; ui = {}; loadBoard(); audio.note(7, 0.04); return }
     audio.arp([0, 7, 12], 0.04)
     if (window.parent !== window) window.parent.postMessage({ type: 'dsh-arcade:open', game: r.id }, '*')
     else if (r.id !== 'schulte') location.href = r.id + '.html'   // 单独预览时直接跳过去

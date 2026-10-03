@@ -22,6 +22,16 @@
 - 打开「按游戏手感瞄准」后，瞄准训练和架枪训练里点一下会锁定鼠标（Pointer Lock），每个鼠标计数按游戏公式转动（CS：灵敏度 × 0.022°，瓦罗兰特：灵敏度 × 0.07°），画面宽度对应游戏水平视野（106.26° / 103°），所以甩到画面边缘要动的手腕距离和游戏里一致。按 ESC 解锁。
 - 会优先请求不经过系统指针加速的「原始输入」；设置页会显示是否拿到了。拿不到时手感只能参考；锁定被拒绝时自动退回跟随系统光标。
 
+## 线上排行榜
+
+选单里点「排行榜」可以看三个游戏的全球榜（每人每个游戏只留最好的一条），点「上传我的最佳」会打开一个填好成绩的 GitHub 新建 Issue 页面，用你的 GitHub 账号点 **Submit new issue** 就行。仓库里的 GitHub Actions 机器人会审核成绩、更新 [leaderboard.json](leaderboard.json)，然后回复名次并关闭 Issue，大约 1 分钟后插件里就能看到。
+
+- **架枪训练**：先比击杀再比分。上传每个击杀的反应时间和敌人反应时间，机器人检查反应在 100ms 以上、敌人反应时间符合 650 → 300ms 的规律，并按明细重算分数。
+- **瞄准训练**：比分数。上传每一次点击（命中的反应时间 / 空枪），机器人按规则重放一遍算分。
+- **舒尔特斩**：比 5×5 方阵的最快用时。它本地没有每一刀的明细，只检查数值是否合理。
+
+游戏完全跑在浏览器里，校验只能挡住随手改数字，挡不住专门研究代码的人；每条成绩都挂着 GitHub 账号、提交记录公开可查，发现作弊会直接删榜。审核逻辑在 [scripts/leaderboard.mjs](scripts/leaderboard.mjs)。
+
 ## 安装
 
 需要 Node.js（`npx` 会自动下载 dsh）。
@@ -70,6 +80,8 @@ games/hub.html      ForCNFps 选单 + 灵敏度设置
 games/aim.html      瞄准训练
 games/hold.html     架枪训练
 games/schulte.html  舒尔特斩（单文件打包产物）
+scripts/leaderboard.mjs  排行榜机器人：校验成绩、更新 leaderboard.json、回复 Issue（由 .github/workflows/leaderboard.yml 触发）
+leaderboard.json    线上排行榜数据（机器人维护，别手改）
 scripts/build.mjs   内联 pixelkit，把各页面填进源码，包成 dsh 网页端认的模块格式，输出 client.js
 client.js           打包产物，已提交，方便直接从 GitHub 安装
 ```

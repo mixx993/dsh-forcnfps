@@ -1,0 +1,39 @@
+# 排行榜：有人用插件生成的 Issue 提交成绩时，校验后更新 leaderboard.json，再回复并关闭 Issue。
+# 只跑默认分支上的 scripts/leaderboard.mjs，Issue 内容只当数据解析，不会被执行。
+name: leaderboard
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: leaderboard          # 排队一个个处理，避免同时改 leaderboard.json
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    if: contains(github.event.issue.body, '<!-- forcnfps-score -->')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 校验成绩
+        run: node scripts/leaderboard.mjs apply
+      - name: 更新榜单
+        run: |
+          if git diff --quiet -- leaderboard.json; then echo "榜单没变"; exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add leaderboard.json
+          git commit -m "leaderboard: #${{ github.event.issue.number }}"
+          git push
+      - name: 回复并关闭
+        run: node scripts/leaderboard.mjs reply
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

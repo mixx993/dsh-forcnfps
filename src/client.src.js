@@ -6,6 +6,7 @@ const h = React.createElement
 const { useEffect, useRef, useState } = React
 
 const ID = 'dsh-forcnfps'
+const REPO = 'mixx993/dsh-forcnfps'
 const HUB_HTML = __GAME_HTML_HUB__
 const GAMES = {
   schulte: { title: '舒尔特斩', html: __GAME_HTML_SCHULTE__ },
@@ -65,13 +66,19 @@ function ArcadeTab(props) {
     prev.current = running
   }, [running])
 
-  // 选单页点了某个游戏、游戏里点了「退出」都会 postMessage 过来；只认自己这个 iframe 发的
+  // 选单页点了某个游戏、游戏里点了「退出」、排行榜要打开链接，都会 postMessage 过来；只认自己这个 iframe 发的
   useEffect(() => {
     const onMessage = e => {
       if (!frame.current || e.source !== frame.current.contentWindow) return
       const d = e.data
       if (d && d.type === 'dsh-arcade:open' && GAMES[d.game]) setGame(d.game)
       else if (d && d.type === 'dsh-arcade:home') setGame(null)
+      // 上传排行榜：游戏小窗口不允许弹窗，由这里打开 GitHub 的新建 Issue 页面；只放行本仓库的地址
+      else if (d && d.type === 'dsh-arcade:open-url' && typeof d.url === 'string' && d.url.startsWith(`https://github.com/${REPO}/issues/new?`)) {
+        let ok = false
+        try { const w = window.open(d.url, '_blank'); if (w) { try { w.opener = null } catch (err) {} ok = true } } catch (err) {}
+        frame.current.contentWindow.postMessage({ type: 'dsh-arcade:open-url-result', ok }, '*')
+      }
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
