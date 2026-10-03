@@ -20,13 +20,14 @@ window.PK = (() => {
   // 画布：所有内容画在约 targetW 像素宽的缓冲上，再无平滑整数倍放大到屏幕
   function screen(cv, { targetW = 132, minH = 200 } = {}) {
     const out = cv.getContext('2d'), buf = document.createElement('canvas')
-    const S = { cv, buf, g: buf.getContext('2d'), P: 2, W: 0, H: 0, OX: 0, OY: 0 }
+    const S = { cv, buf, g: buf.getContext('2d'), P: 2, W: 0, H: 0, OX: 0, OY: 0, cssPerArt: 1 }
     g = S.g
     S.resize = () => {
       const dpr = Math.min(devicePixelRatio || 1, 3)
       const dw = Math.round(innerWidth * dpr), dh = Math.round(innerHeight * dpr)
       cv.width = dw; cv.height = dh
       S.P = Math.max(2, Math.floor(Math.min(dw / targetW, dh / minH)))   // 一个美术像素占几个设备像素
+      S.cssPerArt = S.P / dpr                                               // 一个美术像素占几个 CSS 像素（和屏幕物理尺寸挂钩）
       S.W = Math.floor(dw / S.P); S.H = Math.floor(dh / S.P)
       S.OX = Math.floor((dw - S.W * S.P) / 2); S.OY = Math.floor((dh - S.H * S.P) / 2)
       buf.width = S.W; buf.height = S.H
@@ -251,19 +252,25 @@ window.PK = (() => {
   }
 
   // ---------- 灵敏度 ----------
-  // 游戏里每个鼠标计数转动「灵敏度 × yaw」度；fov 是 16:9 下的水平视野，用来把角度换成画面上的像素
+  // 游戏里每个鼠标计数转动「灵敏度 × yaw」度。fov 是水平视野：CS2 16:9 是 106.26°，4:3 拉伸是 90°；瓦罗兰特固定 103°。
+  // 换算时假设游戏全屏铺满这块显示器：显示器宽度（CSS 像素）对应整个水平视野，侧栏就是显示器上的一扇小窗，
+  // 这样鼠标移动同样距离，准星在屏幕上走过的物理距离和游戏里一样。
   const SENS_GAMES = {
-    cs: { name: 'CS2/CSGO', short: 'CS2', yaw: 0.022, fov: 106.26 },
+    cs: { name: 'CS2/CSGO', short: 'CS2', yaw: 0.022, fov: 106.26, fov43: 90 },
     val: { name: '瓦罗兰特', short: 'VAL', yaw: 0.07, fov: 103 },
   }
+  const fovOf = v => (v.game === 'cs' && v.aspect === '4:3' ? SENS_GAMES.cs.fov43 : SENS_GAMES[v.game].fov)
+  const screenW = () => (window.screen && window.screen.width) || 1920
   const SENS_KEY = 'dsh-arcade-sens-v1', RAW_KEY = 'dsh-arcade-raw-v1'
   const sens = {
     games: SENS_GAMES,
     get() {
       const v = json(SENS_KEY) || {}
-      return { game: SENS_GAMES[v.game] ? v.game : 'cs', dpi: v.dpi > 0 ? v.dpi : 800, value: v.value > 0 ? v.value : 1.2, on: v.on === true }
+      return { game: SENS_GAMES[v.game] ? v.game : 'cs', dpi: v.dpi > 0 ? v.dpi : 800, value: v.value > 0 ? v.value : 1.2, on: v.on === true, aspect: v.aspect === '4:3' ? '4:3' : '16:9' }
     },
-    set(v) { store.set(SENS_KEY, JSON.stringify({ game: v.game, dpi: v.dpi, value: v.value, on: v.on })) },
+    set(v) { store.set(SENS_KEY, JSON.stringify({ game: v.game, dpi: v.dpi, value: v.value, on: v.on, aspect: v.aspect })) },
+    fov: fovOf,
+    screenW,
     edpi: v => Math.round(v.dpi * v.value),
     cm360: v => 360 / (v.value * SENS_GAMES[v.game].yaw) / v.dpi * 2.54,          // 转一圈要移动多少厘米
     convert: (v, to) => v.value * SENS_GAMES[v.game].yaw / SENS_GAMES[to].yaw,    // 换算成另一款游戏的等效灵敏度
@@ -279,7 +286,7 @@ window.PK = (() => {
     document.addEventListener('mousemove', e => {
       if (!P.locked) return
       const v = sens.get(), gm = SENS_GAMES[v.game]
-      const k = v.value * gm.yaw * (S.W / gm.fov)       // 每个计数走多少美术像素 = 度/计数 × 像素/度（画布宽度对应水平视野）
+      const k = v.value * gm.yaw * (screenW() / fovOf(v)) / S.cssPerArt   // 每个计数走多少美术像素 = 度/计数 × 屏幕像素/度 ÷ 每美术像素的屏幕像素
       if (opts.onDelta) { opts.onDelta(e.movementX * k, e.movementY * k); return }
       P.x = Math.max(0, Math.min(S.W - 1, P.x + e.movementX * k))
       P.y = Math.max(0, Math.min(S.H - 1, P.y + e.movementY * k))
@@ -313,5 +320,7 @@ window.PK = (() => {
     return P
   }
 
-  return { C, RM, B4, store, json, screen, btext, btextW, ctext, icon, ring, panel, button, inRect, starfield, drawStars, audio, muteButton, exitButton, goHome, crosshair, sens, pointer }
+  const isEsc = e => e.key === 'Escape' || e.key === 'Esc'
+
+  return { C, RM, B4, isEsc, store, json, screen, btext, btextW, ctext, icon, ring, panel, button, inRect, starfield, drawStars, audio, muteButton, exitButton, goHome, crosshair, sens, pointer }
 })()

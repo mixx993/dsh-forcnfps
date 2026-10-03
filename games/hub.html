@@ -159,7 +159,7 @@
     draft.value = parsedVal() || draft.value; draft.valText = String(draft.value)
     SENS.set(draft)
   }
-  const live = () => ({ game: draft.game, dpi: parsedDpi() || draft.dpi, value: parsedVal() || draft.value })
+  const live = () => ({ game: draft.game, dpi: parsedDpi() || draft.dpi, value: parsedVal() || draft.value, aspect: draft.aspect })
 
   function drawMenu(now, cx) {
     const cw = Math.min(S.W - 12, 124), ch = 34, gap = 6
@@ -259,7 +259,7 @@
     btext(mb ? mb.show : '--', px + pw, y + 4, C.gold, 1, 'right')
     y += 17
     if (mb && mb.payload) ui.upload = PK.button(px, y, pw, '上传我的最佳')
-    else ctext(mb ? '旧纪录没有明细，再打一局' : '先去玩一局', cx, y + 2, C.slate, { align: 'center' })
+    else ctext(mb ? '旧纪录没有明细，再打一局' : boardTab === 'schulte' ? '先打一局 5×5 方阵' : '先去玩一局', cx, y + 2, C.slate, { align: 'center' })
     y += 23
     const age = notice ? now - notice.at : Infinity
     const msg = !notice || age > 12000 ? null
@@ -287,7 +287,8 @@
   function drawSens(now, cx) {
     ui = {}
     const pw = Math.min(S.W - 12, 124), px = Math.floor((S.W - pw) / 2)
-    let y = Math.max(4, Math.floor((S.H - 236) / 2))
+    let y = Math.max(20, Math.floor((S.H - 258) / 2))
+    ui.back = smallBtn(3, 3, '返回')
     ctext('灵敏度', cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
     btext('MOUSE SENSITIVITY', cx, y + 21, C.slate, 1, 'center')
     y += 32
@@ -302,20 +303,32 @@
       if (id === 'cs') btext(SENS.games.cs.name, r.x + Math.floor(r.w / 2), r.y + 6, on ? C.ink : C.fog, 1, 'center')
       else ctext(SENS.games.val.name, r.x + Math.floor(r.w / 2), r.y + 1, on ? C.ink : C.fog, { align: 'center' })
     })
-    y += 23
+    y += 20
+    // CS 的画面比例：4:3 拉伸时水平视野是 90°，同样灵敏度屏幕上会更快；瓦罗兰特固定 16:9
+    if (draft.game === 'cs') {
+      ;['16:9', '4:3'].forEach((id, i) => {
+        const r = { x: px + i * (tw + 4), y, w: tw, h: 12 }, on = draft.aspect === id
+        ui['asp_' + id] = r
+        g.fillStyle = on ? C.navy : C.ink; g.fillRect(r.x, r.y, r.w, r.h)
+        g.fillStyle = on ? C.sky : C.dusk; g.fillRect(r.x, r.y + r.h - 1, r.w, 1)
+        btext(id === '4:3' ? '4:3 STRETCH' : '16:9', r.x + Math.floor(r.w / 2), r.y + 4, on ? C.white : C.slate, 1, 'center')
+      })
+    } else btext('16:9 · FOV 103', cx, y + 4, C.slate, 1, 'center')
+    y += 17
 
     field('dpi', '鼠标 DPI', y, px, pw); y += 20
     field('val', '游戏灵敏度', y, px, pw); y += 22
 
     // 换算结果
     const v = live(), other = v.game === 'cs' ? 'val' : 'cs'
-    g.fillStyle = C.dusk; g.fillRect(px, y, pw, 40)
+    g.fillStyle = C.dusk; g.fillRect(px, y, pw, 49)
     btext('EDPI', px + 5, y + 5, C.fog); btext(SENS.edpi(v), px + pw - 5, y + 5, C.white, 1, 'right')
     btext('CM/360', px + 5, y + 14, C.fog); btext(SENS.cm360(v).toFixed(1), px + pw - 5, y + 14, C.white, 1, 'right')
     if (other === 'val') ctext('= 瓦罗兰特', px + 4, y + 22, C.fog)
     else { btext('= CS2/CSGO', px + 5, y + 26, C.fog) }
     btext(SENS.convert(v, other).toFixed(3), px + pw - 5, y + 26, C.gold, 1, 'right')
-    y += 46
+    btext(`FOV ${SENS.fov({ ...v, aspect: draft.aspect })} · SCREEN ${SENS.screenW()}`, px + 5, y + 38, C.slate)   // 按全屏铺满这块显示器换算
+    y += 55
 
     // 开关：是否在游戏里按这个灵敏度移动准星
     ctext('按游戏手感瞄准', px, y + 1, C.fog)
@@ -330,9 +343,7 @@
     const [rawText, rawCol] = RAW[raw] || ['原始输入：未检测', C.slate]
     ctext(rawText, px, y, rawCol)
     y += 15
-    ctext('游戏里点一下锁定鼠标', px, y, C.slate)
-    y += 14
-    ctext('按 ESC 解锁', px, y, C.slate)
+    ctext('点击锁定，ESC 解锁', px, y, C.slate)
     y += 18
     ui.done = PK.button(px, y, pw, '完成')
   }
@@ -374,7 +385,9 @@
       const hit = Object.keys(ui).find(k => inRect(p.x, p.y, ui[k]))
       if (hit === 'dpi' || hit === 'val') { if (focus && hit !== focus) commit(); focusField(hit); return }
       blurField()
-      if (hit === 'tab_cs' || hit === 'tab_val') { draft.game = hit.slice(4); draft.on = true; commit(); audio.note(7, 0.04) }
+      if (hit === 'back') { commit(); view = 'menu'; audio.note(7, 0.05) }
+      else if (hit === 'tab_cs' || hit === 'tab_val') { draft.game = hit.slice(4); draft.on = true; commit(); audio.note(7, 0.04) }
+      else if (hit === 'asp_16:9' || hit === 'asp_4:3') { draft.aspect = hit.slice(4); commit(); audio.note(7, 0.04) }
       else if (hit === 'toggle') { draft.on = !draft.on; commit(); audio.note(draft.on ? 12 : 0, 0.05) }
       else if (hit === 'done') { commit(); view = 'menu'; audio.note(7, 0.05) }
       return
@@ -424,6 +437,14 @@
     else if (e.key === 'Escape') { draft.dpiText = String(draft.dpi); draft.valText = String(draft.value); focus = null; input.blur() }
   })
   input.addEventListener('blur', () => { if (focus) { commit(); focus = null } })
+
+  addEventListener('keydown', e => {
+    if (!PK.isEsc(e) || e.target === input) return
+    if (view === 'sens') { blurField(); commit(); view = 'menu'; audio.note(7, 0.05) }
+    else if (view === 'board') { view = 'menu'; notice = null; audio.note(7, 0.05) }
+  })
+  // 排行榜页开着时每 30 秒刷新一次，上传后不用退出重进就能看到名次
+  setInterval(() => { if (view === 'board' && board.status !== 'loading') loadBoard() }, 30000)
 
   addEventListener('resize', resize)
   resize()

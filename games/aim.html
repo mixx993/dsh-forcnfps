@@ -214,7 +214,7 @@
     }
     if (streak >= 3) btext('COMBO ' + streak, Math.floor(S.W / 2), y + 21, C.lime, 1, 'center')
     if (P.wantsLock() && (RM || Math.floor(now / 500) % 2 === 0)) {
-      ctext('点击画面锁定鼠标', Math.floor(S.W / 2), Math.min(S.H - 14, area.y + area.s + 6), C.lime, { align: 'center' })
+      ctext('点击继续，ESC 退出', Math.floor(S.W / 2), Math.min(S.H - 14, area.y + area.s + 6), C.lime, { align: 'center' })
     }
   }
 
@@ -287,6 +287,8 @@
     requestAnimationFrame(frame)
   }
 
+  // ESC 回主界面。鼠标锁定时第一下 ESC 被浏览器拿去解锁，再按一下才退出
+  addEventListener('keydown', e => { if (PK.isEsc(e) && !P.locked) { e.preventDefault(); PK.goHome() } })
   if (/[?&]debug/.test(location.search)) window.__aim = () => ({ state, score, seq, targets: targets.map(t => cellCenter(t.c)), start: startOrb(), W: S.W, H: S.H })   // 调试用
   addEventListener('resize', resize)
   resize()

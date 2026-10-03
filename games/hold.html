@@ -479,7 +479,11 @@
     if (P.wantsLock()) { P.lock(); return }   // 中途按 ESC 解锁了：这一下只用来重新锁定，不算开枪
     shoot(now)
   })
-  addEventListener('keydown', e => { if ((e.key === 'r' || e.key === 'R') && state === 'play') startReload(performance.now()) })
+  addEventListener('keydown', e => {
+    if ((e.key === 'r' || e.key === 'R') && state === 'play') startReload(performance.now())
+    // ESC 回主界面。鼠标锁定时第一下 ESC 被浏览器拿去解锁，再按一下才退出
+    if (PK.isEsc(e) && !P.locked) { e.preventDefault(); PK.goHome() }
+  })
 
   function shoot(now) {
     if (reloadAt) return
@@ -705,7 +709,7 @@
   }
   function drawPrompt(now) {
     const y = 56
-    if (P.wantsLock()) { if (RM || Math.floor(now / 500) % 2 === 0) plate('点击画面锁定鼠标', C.lime, y); return }
+    if (P.wantsLock()) { if (RM || Math.floor(now / 500) % 2 === 0) plate('点击继续，ESC 退出', C.lime, y); return }
     if (state === 'dying') { plate(rd.cause === 'early' ? '开枪暴露了位置' : '你被击杀了', C.red, y); return }
     if (phase === 'place') plate('准星对准白圈，稳住', C.white, y)
     else if (phase === 'hold' || phase === 'peek') plate('稳住，等他探头', C.fog, y)    // 探头时文字不变，免得成了提示
