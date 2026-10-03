@@ -4,8 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>架枪训练</title>
-<!-- CS 风格架枪：准星先架到点位上稳住，随机等待后敌人从门左/门右/箱子后探头，第一时间开枪。
-     一局 10 回合，练稳定性（等待时准星的抖动）和反应（探头到开枪的毫秒数）。场景仿 Dust2，像素风，底层工具在 pixelkit.js。 -->
+<!-- 像素风 CS 第一人称架枪：Dust2 A 大道，准星固定在屏幕中心，动鼠标转视角。
+     每回合先把准星对准白圈稳住，随机等待后敌人从远处门缝 / 中距离箱子 / 近处石柱探头；
+     敌人露头后在「敌人反应时间」内没打死他，他就打死你，游戏结束。反应时间从 650ms 起，每杀一个快 25ms，最快 300ms。
+     开枪太早会暴露位置，敌人立刻预瞄着拉出来。连续开枪会散布变大，弹匣打空要换弹。底层工具在 pixelkit.js。 -->
 <style>
   * { margin:0; padding:0; }
   html, body { height:100%; background:#1a1c2c; overflow:hidden; user-select:none; -webkit-user-select:none; }
@@ -17,453 +19,746 @@
 <script src="pixelkit.js"></script>
 <script>
 (() => {
-  const { C, RM, B4, store, json, btext, ctext, icon, ring, panel, button, inRect, audio } = PK
-  const ROUNDS = 10
+  const { C, RM, B4, store, json, btext, btextW, ctext, icon, ring, panel, button, inRect, audio } = PK
   const KEY_BEST = 'hold-angle-best-v1'
-  const SLIDE = 90, RETREAT = 90                     // 探出 / 缩回用时（毫秒）
-  const SLOW = /[?&]slow/.test(location.search)       // 调试：地址带 ?slow 时敌人停留 10 倍时长
-  const exposure = r => (700 - r * 25) * (SLOW ? 10 : 1)   // 第 r 回合（0 起）敌人完全露出的时长，越往后越短
-  const ZONE = 4                                      // 架点判定半径（美术像素）
+  const SLOW = /[?&]slow/.test(location.search)          // 调试：地址带 ?slow 时敌人反应时间 ×10，并暴露 window.__hold()
+  const SLIDE = 90                                         // 敌人探出用时（毫秒），分 3 步
+  const ttkFor = kills => Math.max(300, 650 - kills * 25) * (SLOW ? 10 : 1)   // 敌人反应时间：露头后多久打死你
+  const ZONE = 3                                           // 架点判定半径（美术像素）
+  const RELOAD = 2000
   const RANKS = [
-    [2300, '全球精英', 'GLOBAL ELITE'], [1900, '传奇之鹰', 'LEGENDARY EAGLE'],
-    [1500, '守护精英', 'MASTER GUARDIAN'], [1000, '黄金新星', 'GOLD NOVA'], [0, '白银', 'SILVER'],
+    [16, '全球精英', 'GLOBAL ELITE'], [12, '传奇之鹰', 'LEGENDARY EAGLE'],
+    [8, '守护精英', 'MASTER GUARDIAN'], [4, '黄金新星', 'GOLD NOVA'], [0, '白银', 'SILVER'],
   ]
-  const rankOf = score => RANKS.find(r => score >= r[0])
+  const rankOf = kills => RANKS.find(r => kills >= r[0])
+  const rand = (a, b) => a + Math.random() * (b - a)
+  const R = Math.round
 
   const S = PK.screen(document.getElementById('cv'))
   const g = S.g
-  const P = PK.pointer(S)        // 准星位置；开了灵敏度换算时会锁定鼠标
-  const rand = (a, b) => a + Math.random() * (b - a)
+  const cam = { x: 0, y: 0 }   // 世界坐标里，屏幕中心（准星）对着的点
+  const P = PK.pointer(S, { onDelta: (dx, dy) => { if (state === 'play' || state === 'dying') { cam.x += dx; cam.y += dy; clampCam() } } })
 
-  // ---------- 敌人精灵（9×22，面朝右；r 头巾 s 皮肤 k 深色 g/d 衣服 n 裤子 w 枪） ----------
-  const ENEMY = [
-    '...rrr...', '..rrrrr..', '..ksssk..', '..sksks..', '..sssss..', '...sss...',
-    '.ggggggg.', 'gggggggww', 'ggdgggwww', 'ggdggg.w.', 'ggdggg...', '.gdggg...', '.ggggg...',
-    '.nnnnn...', '.nn.nn...', '.nn.nn...', '.nn.nn...', '.nn.nn...', '.nn.nn...', '.nn.nn...',
-    '.kk.kk...', 'kkk.kkk..',
-  ]
-  const EW = 9, EH = 22
-  const PAL = { r: C.red, s: C.orange, k: C.ink, g: C.green, d: C.teal, n: C.navy, w: C.slate }
-  function sprite(flip, tint) {
-    const c = document.createElement('canvas')
-    c.width = EW; c.height = EH
-    const x2 = c.getContext('2d')
-    ENEMY.forEach((row, y) => {
-      for (let x = 0; x < EW; x++) {
-        const ch = row[x]
-        if (ch === '.') continue
-        x2.fillStyle = tint || PAL[ch]
-        x2.fillRect(flip ? EW - 1 - x : x, y, 1, 1)
+  // ---------- 像素多边形：逐行求交填充，col 可以是颜色或 (x,y)=>颜色 ----------
+  function fillPoly(ctx, pts, col) {
+    let y0 = Infinity, y1 = -Infinity
+    for (const p of pts) { y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]) }
+    for (let y = Math.floor(y0); y <= Math.ceil(y1); y++) {
+      const yc = y + 0.5, xs = []
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const [xi, yi] = pts[i], [xj, yj] = pts[j]
+        if ((yi > yc) !== (yj > yc)) xs.push(xi + (yc - yi) * (xj - xi) / (yj - yi))
       }
-    })
-    return c
+      xs.sort((a, b) => a - b)
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        const a = R(xs[k]), b = R(xs[k + 1])
+        if (b <= a) continue
+        if (typeof col === 'string') { ctx.fillStyle = col; ctx.fillRect(a, y, b - a, 1) }
+        else for (let x = a; x < b; x++) { ctx.fillStyle = col(x, y); ctx.fillRect(x, y, 1, 1) }
+      }
+    }
   }
-  const SPR = { right: sprite(false), left: sprite(true), flashR: sprite(false, C.white), flashL: sprite(true, C.white), deadR: sprite(false, C.red), deadL: sprite(true, C.red) }
+  const dith = (x, y, k) => B4[y & 3][x & 3] / 16 < k        // Bayer 抖动：k∈[0,1] 是这一点取第二种颜色的比例
 
-  // ---------- 场景：三层预渲染，敌人夹在层与层之间，被墙和箱子自然挡住 ----------
-  // bg：天空 + 门洞里的暗处；wall：带门洞的砖墙和地面；crate：木箱
-  let scene, ground, wallTop, door, crate, HY
+  // ---------- 世界布局（单位：美术像素；世界是屏幕的 2×2，镜头在里面平移） ----------
+  let W, H, WW, WH, WC, hy, gy, far, door, leafW, gap, crate, pillar, floorMid, floorNear, sideW, crateSide, EH
   const layers = {}
+  let VM = null, vmS = 1, vmGeo = null
+
   function layout() {
     S.resize()
-    const sw = S.W - 8
-    const sh = Math.max(100, Math.min(S.H - 64, Math.round(sw * 1.05)))
-    HY = Math.max(2, Math.floor((S.H - sh - 50) / 2))
-    scene = { x: 4, y: HY + 22, w: sw, h: sh }
-    wallTop = scene.y + Math.round(sh * 0.2)
-    ground = scene.y + Math.round(sh * 0.84)
-    const dw = Math.round(sw * 0.32), dh = Math.round(sh * 0.5)
-    door = { x: scene.x + Math.round(sw * 0.14), y: ground - dh, w: dw, h: dh }
-    const cw = Math.round(sw * 0.27), ch = Math.round(sh * 0.19)
-    crate = { x: scene.x + sw - cw - Math.round(sw * 0.08), y: ground - ch, w: cw, h: ch }
+    W = S.W; H = S.H
+    WW = W * 2; WH = H * 2
+    WC = { x: R(WW / 2), y: R(WH / 2) }
+    hy = WC.y - R(H * 0.03)                       // 地平线（视线高度）
+    gy = hy + R(H * 0.04)                         // 远墙墙根
+    const fw = R(W * 0.62), fh = R(H * 0.2)
+    far = { x: WC.x - R(fw / 2), y: gy - fh, w: fw, h: fh, r: WC.x - R(fw / 2) + fw }
+    const dw = R(fw * 0.46), dh = R(fh * 0.82)
+    door = { x: WC.x - R(dw / 2) + R(W * 0.02), y: gy - dh, w: dw, h: dh }
+    door.r = door.x + dw
+    leafW = R(dw * 0.52)
+    gap = { x: door.x + leafW, y: door.y, w: R(dw * 0.3), h: dh }
+    gap.r = gap.x + gap.w
+    floorMid = gy + R(H * 0.13)
+    floorNear = gy + R(H * 0.27)
+    crate = { x: WC.x + R(W * 0.17), w: R(W * 0.3), h: R(H * 0.25) }
+    crate.y = floorMid - crate.h; crate.r = crate.x + crate.w
+    pillar = { x: WC.x - R(W * 0.78), r: WC.x - R(W * 0.34) }
+    sideW = Math.max(4, R(W * 0.05)); crateSide = Math.max(2, R(W * 0.022))
+    EH = { door: R(H * 0.115), crate: R(H * 0.2), pillar: R(H * 0.3) }
     bake()
+    bakeViewmodel()
+    if (!cam.x) { cam.x = WC.x; cam.y = WC.y }
+    clampCam()
+  }
+  function clampCam() {
+    cam.x = Math.max(W / 2, Math.min(WW - W / 2, cam.x))
+    cam.y = Math.max(H / 2, Math.min(WH - H / 2, cam.y))
   }
 
-  function layer(draw) {
-    const c = document.createElement('canvas')
-    c.width = S.W; c.height = S.H
-    const x2 = c.getContext('2d')
-    const px = (x, y, col) => { x2.fillStyle = col; x2.fillRect(x, y, 1, 1) }
-    draw(x2, px)
-    return c
-  }
-  // 门洞是否包含某像素（顶部切角成拱形）
-  function inDoor(x, y) {
-    if (x < door.x || x >= door.x + door.w || y < door.y || y >= ground) return false
-    const row = y - door.y, cut = [3, 2, 1][row] || 0
-    return x >= door.x + cut && x < door.x + door.w - cut
-  }
+  function canvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c }
 
   function bake() {
-    const { x: sx, y: sy, w: sw, h: sh } = scene
-    let seed = 7
+    let seed = 11
     const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+    const nearTop = far.y - R(H * 0.42), nearBot = gy + R(H * 0.6)
 
-    layers.bg = layer((x2, px) => {
-      // 天空：底部几行抖动成浅青色的雾
-      for (let y = sy; y < wallTop; y++) for (let x = sx; x < sx + sw; x++) {
-        const k = (y - (wallTop - 5)) / 5
-        px(x, y, k > 0 && B4[y & 3][x & 3] / 16 < k ? C.cyan : C.sky)
+    // L0：天空、两侧墙、地面、远墙和门洞里的暗处
+    const L0 = canvas(WW, WH), a = L0.getContext('2d')
+    a.fillStyle = C.sky; a.fillRect(0, 0, WW, WH)
+    for (let y = far.y - R(H * 0.12); y < gy; y++) for (let x = 0; x < WW; x++) {
+      const k = (y - (far.y - R(H * 0.12))) / (H * 0.12)
+      a.fillStyle = dith(x, y, k * 0.9) ? C.cyan : C.sky
+      a.fillRect(x, y, 1, 1)
+    }
+    // 几朵云
+    for (const [cx, cy, w] of [[WC.x - W * 0.45, far.y - H * 0.3, 22], [WC.x + W * 0.25, far.y - H * 0.42, 30], [WC.x + W * 0.6, far.y - H * 0.18, 16]]) {
+      a.fillStyle = C.white
+      a.fillRect(R(cx), R(cy), w, 2); a.fillRect(R(cx + w * 0.2), R(cy - 2), R(w * 0.45), 2)
+      a.fillStyle = C.cyan; a.fillRect(R(cx - 3), R(cy + 2), w + 6, 1)
+    }
+    // 地面：沙色，透视方向的地砖缝 + 越近越粗的颗粒
+    const vpx = WC.x
+    fillPoly(a, [[0, nearBot], [far.x, gy], [far.r, gy], [WW, nearBot], [WW, WH], [0, WH]], (x, y) => {
+      const d = y - hy
+      for (const lane of [-0.9, 0.9]) {                                                   // 两道车辙，汇向灭点
+        const lx = vpx + lane * d * 0.9
+        if (Math.abs(x - lx) < 0.6 + d * 0.012) return dith(x, y, 0.5) ? C.orange : C.gold
       }
-      // 一朵像素云
-      const cx = sx + Math.round(sw * 0.62), cy = sy + Math.round((wallTop - sy) * 0.35)
-      x2.fillStyle = C.white
-      x2.fillRect(cx, cy, 14, 2); x2.fillRect(cx + 3, cy - 2, 7, 2); x2.fillRect(cx - 3, cy + 2, 20, 1)
-      x2.fillStyle = C.cyan; x2.fillRect(cx - 2, cy + 3, 18, 1)
-      // 门洞里：深处偏暗，顶上漏一点光
-      for (let y = door.y; y < ground; y++) for (let x = door.x; x < door.x + door.w; x++) {
-        const k = 1 - (y - door.y) / 12
-        px(x, y, k > 0 && B4[y & 3][x & 3] / 16 < k ? C.navy : y >= ground - 3 ? C.dusk : C.ink)
-      }
+      return dith(x, y, 0.04 + Math.min(0.18, (y - gy) / H * 0.3)) ? C.orange : C.gold
     })
+    // 两侧墙：横向砖缝按透视汇聚；左墙朝右受光，右墙背光
+    const sideWall = (left) => {
+      const x0 = left ? 0 : WW, x1 = left ? far.x : far.r
+      fillPoly(a, [[x0, nearTop], [x1, far.y], [x1, gy], [x0, nearBot]], (x, y) => {
+        const t = (x - x0) / (x1 - x0)
+        const top = nearTop + (far.y - nearTop) * t, bot = nearBot + (gy - nearBot) * t
+        const v = (y - top) / (bot - top), v2 = (y + 1 - top) / (bot - top)
+        if (v < 0.012) return C.white                                                     // 墙顶石沿
+        if (v < 0.03) return C.orange
+        const rows = 9
+        if (Math.floor(v * rows) !== Math.floor(v2 * rows)) return C.orange               // 砖缝（横）
+        const z = 1 / (1.08 - t), z2 = 1 / (1.08 - (x + (left ? 1 : -1) - x0) / (x1 - x0))
+        const shift = (Math.floor(v * rows) & 1) * 0.5
+        if (Math.floor(z * 2 + shift) !== Math.floor(z2 * 2 + shift)) return C.orange     // 砖缝（竖，越远越密）
+        if (bot - y < 3 + 6 * (1 - t)) return dith(x, y, 0.6) ? C.red : C.orange          // 墙根阴影
+        return left ? (dith(x, y, 0.04) ? C.orange : C.gold) : (dith(x, y, 0.4) ? C.orange : C.gold)
+      })
+    }
+    sideWall(true); sideWall(false)
+    // 远墙
+    for (let y = far.y; y < gy; y++) for (let x = far.x; x < far.r; x++) {
+      const row = Math.floor((y - far.y - 2) / 4)
+      let col = dith(x, y, 0.06) ? C.orange : C.gold
+      if (y - far.y < 1) col = C.white
+      else if (y - far.y < 2) col = C.orange
+      else if ((y - far.y - 2) % 4 === 3) col = C.orange
+      else if ((x - far.x + (row & 1) * 4) % 8 === 0) col = C.orange
+      else if (gy - y <= 2) col = C.red
+      a.fillStyle = col; a.fillRect(x, y, 1, 1)
+    }
+    // 门洞里：暗处，顶上漏一点光
+    for (let y = door.y; y < gy; y++) for (let x = door.x; x < door.r; x++) {
+      const k = 1 - (y - door.y) / (door.h * 0.5)
+      a.fillStyle = k > 0 && dith(x, y, k * 0.7) ? C.navy : (gy - y <= 2 ? C.dusk : C.ink)
+      a.fillRect(x, y, 1, 1)
+    }
+    layers.bg = L0
 
-    layers.wall = layer((x2, px) => {
-      for (let y = wallTop; y < ground; y++) for (let x = sx; x < sx + sw; x++) {
-        if (inDoor(x, y)) continue
-        const row = Math.floor((y - wallTop - 2) / 6)
-        let col = C.gold
-        if (y === wallTop) col = C.orange
-        else if (y === wallTop + 1) col = C.red
-        else if ((y - wallTop - 2) % 6 === 5) col = C.orange                                 // 砖缝（横）
-        else if ((x - sx + (row & 1) * 6) % 12 === 0) col = C.orange                         // 砖缝（竖，错缝）
-        else if (ground - y <= 6 && B4[y & 3][x & 3] / 16 < (7 - (ground - y)) / 8) col = C.orange   // 墙根渐暗
-        else { const r = rnd(); if (r < 0.04) col = C.orange; else if (r < 0.05) col = C.white }      // 风化斑点
-        px(x, y, col)
+    // L1：A 大门的两扇蓝色木门 + 门框
+    const L1 = canvas(WW, WH), b = L1.getContext('2d')
+    const leaf = (x0, w, dark) => {
+      for (let y = door.y; y < gy; y++) for (let x = x0; x < x0 + w; x++) {
+        const fy = (y - door.y) / door.h
+        let col = (x - x0) % 3 === 2 ? (dark ? C.ink : C.navy) : (dark ? C.navy : C.blue)        // 竖木板
+        if (Math.abs(fy - 0.22) < 0.035 || Math.abs(fy - 0.72) < 0.035) col = (x - x0) % 4 === 1 ? C.fog : C.dusk   // 铁箍 + 铆钉
+        if (!dark && x === x0) col = C.sky
+        if (y >= gy - 1) col = C.ink
+        b.fillStyle = col; b.fillRect(x, y, 1, 1)
       }
-      // 门框（木头）
-      x2.fillStyle = C.red
-      x2.fillRect(door.x - 2, door.y + 3, 2, ground - door.y - 3)
-      x2.fillRect(door.x + door.w, door.y + 3, 2, ground - door.y - 3)
-      x2.fillRect(door.x + 3, door.y - 2, door.w - 6, 2)
-      x2.fillStyle = C.plum
-      x2.fillRect(door.x - 1, door.y + 3, 1, ground - door.y - 3)
-      x2.fillRect(door.x + door.w + 1, door.y + 3, 1, ground - door.y - 3)
-      // 地面
-      for (let y = ground; y < sy + sh; y++) for (let x = sx; x < sx + sw; x++) {
-        const k = (y - ground) / (sy + sh - ground)
-        px(x, y, y === ground ? C.red : B4[y & 3][x & 3] / 16 < k * 0.7 ? C.red : C.orange)
-      }
-    })
+    }
+    leaf(door.x, leafW, false)
+    leaf(gap.r, door.r - gap.r, true)
+    b.fillStyle = C.fog; b.fillRect(door.x - 2, door.y - 3, door.w + 4, 3)
+    b.fillStyle = C.white; b.fillRect(door.x - 2, door.y - 3, door.w + 4, 1)
+    b.fillStyle = C.fog; b.fillRect(door.x - 2, door.y, 2, gy - door.y); b.fillRect(door.r, door.y, 2, gy - door.y)
+    layers.door = L1
 
-    layers.crate = layer((x2, px) => {
-      const { x, y, w, h } = crate
-      for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) if ((i + j) % 2 === 0) px(x + w + i, ground - 1 + j, C.red)   // 地上的影子
-      x2.fillStyle = C.red; x2.fillRect(x, y, w, h)
-      x2.fillStyle = C.orange; x2.fillRect(x + 1, y + 1, w - 2, h - 2)
-      x2.fillStyle = C.gold; x2.fillRect(x + 1, y + 1, w - 2, 1)
-      x2.fillStyle = C.red
-      for (let yy = y + 5; yy < y + h - 2; yy += 5) x2.fillRect(x + 1, yy, w - 2, 1)                     // 木板缝
-      x2.fillRect(x + 3, y + 1, 2, h - 2); x2.fillRect(x + w - 5, y + 1, 2, h - 2)                       // 竖档
-      for (let i = 0; i < w - 10; i++) {                                                                // 斜撑
-        px(x + 5 + i, y + 2 + Math.round(i * (h - 4) / (w - 10)), C.plum)
-        px(x + 5 + i, y + 3 + Math.round(i * (h - 4) / (w - 10)), C.red)
+    // L2：两只叠起来的木箱（在灭点右边，能看到左侧面）
+    const L2 = canvas(WW, WH), c2 = L2.getContext('2d')
+    fillPoly(c2, [[crate.x - crateSide - 2, floorMid - 1], [crate.x, floorMid], [crate.x, floorMid + 3], [crate.x - crateSide - 6, floorMid + 2]], (x, y) => dith(x, y, 0.5) ? C.red : C.orange)   // 影子
+    fillPoly(c2, [[crate.x - crateSide, crate.y + 1], [crate.x, crate.y], [crate.x, floorMid], [crate.x - crateSide, floorMid - 1]], (x, y) => (y - crate.y) % 5 === 0 ? C.plum : C.red)
+    const box = (x, y, w, h) => {
+      c2.fillStyle = C.red; c2.fillRect(x, y, w, h)
+      c2.fillStyle = C.orange; c2.fillRect(x + 2, y + 2, w - 4, h - 4)
+      c2.fillStyle = C.gold; c2.fillRect(x + 1, y + 1, w - 2, 1)
+      c2.fillStyle = C.red
+      for (let yy = y + 6; yy < y + h - 2; yy += 5) c2.fillRect(x + 2, yy, w - 4, 1)
+      for (let i = 0; i < w - 6; i++) {
+        const yy = y + 2 + R(i * (h - 5) / (w - 6))
+        c2.fillStyle = C.plum; c2.fillRect(x + 3 + i, yy, 1, 1)
+        c2.fillStyle = C.red; c2.fillRect(x + 3 + i, yy + 1, 1, 1)
       }
+    }
+    const half = R(crate.h / 2)
+    box(crate.x, crate.y + half, crate.w, crate.h - half)
+    box(crate.x + 2, crate.y, crate.w - 4, half + 1)
+    layers.crate = L2
+
+    // L3：近处石柱（在灭点左边，能看到被太阳照亮的右侧面）
+    const L3 = canvas(WW, WH), d3 = L3.getContext('2d')
+    fillPoly(d3, [[pillar.x, floorNear], [pillar.r + sideW + 4, floorNear - 2], [pillar.r + sideW + 10, floorNear + 3], [pillar.x, floorNear + 5]], (x, y) => dith(x, y, 0.45) ? C.red : C.orange)
+    for (let y = 0; y < floorNear; y++) for (let x = pillar.x; x < pillar.r; x++) {
+      const row = Math.floor(y / 9)
+      let col = dith(x, y, 0.35) ? C.orange : C.gold
+      if (y % 9 === 8) col = C.red
+      else if ((x - pillar.x + (row & 1) * 9) % 18 === 0) col = C.red
+      else if (floorNear - y < 5) col = dith(x, y, 0.5) ? C.red : C.orange
+      d3.fillStyle = col; d3.fillRect(x, y, 1, 1)
+    }
+    fillPoly(d3, [[pillar.r, 0], [pillar.r + sideW, 0], [pillar.r + sideW, floorNear - 2], [pillar.r, floorNear]], (x, y) => {
+      if (x === pillar.r) return C.white
+      return y % 9 === 8 ? C.orange : (dith(x, y, 0.1) ? C.white : C.gold)
     })
+    layers.pillar = L3
+  }
+
+  // ---------- 第一人称持枪（AK-47 + 手套袖子），按屏幕宽度缩放后预渲染 ----------
+  function bakeViewmodel() {
+    vmS = Math.min(W / 134, H / 250) * 1.3
+    const BW = 92, BH = 78
+    const c = canvas(Math.ceil(BW * vmS), Math.ceil(BH * vmS)), x2 = c.getContext('2d')
+    const M = [10, 14], Rr = [100, 58]
+    const L = Math.hypot(Rr[0] - M[0], Rr[1] - M[1])
+    const d = [(Rr[0] - M[0]) / L, (Rr[1] - M[1]) / L], n = [-d[1], d[0]]   // d 指向枪托，n 指向下方
+    const Pt = (t, o) => [(M[0] + d[0] * L * t + n[0] * o) * vmS, (M[1] + d[1] * L * t + n[1] * o) * vmS]
+    const quad = (t0, t1, c0, h0, h1, col) => fillPoly(x2, [Pt(t0, c0 - h0), Pt(t1, c0 - h1), Pt(t1, c0 + h1), Pt(t0, c0 + h0)], col)
+    const edge = (t0, t1, o0, o1, col) => {
+      const steps = Math.ceil(L * (t1 - t0) * vmS)
+      x2.fillStyle = col
+      for (let i = 0; i <= steps; i++) { const t = t0 + (t1 - t0) * i / steps, p = Pt(t, o0 + (o1 - o0) * i / steps); x2.fillRect(R(p[0]), R(p[1]), 1, 1) }
+    }
+    const L_ = (x, y) => [x * vmS, y * vmS]
+
+    // 左臂（袖子 + 手套），先画在枪下面
+    const arm = (a0, a1, b0, b1) => {
+      fillPoly(x2, [a0, a1, b1, b0], C.navy)
+      const steps = 40
+      x2.fillStyle = C.blue
+      for (let i = 0; i <= steps; i++) { const k = i / steps; x2.fillRect(R(a1[0] + (b1[0] - a1[0]) * k) - 1, R(a1[1] + (b1[1] - a1[1]) * k), 1, 1) }
+    }
+    arm(Pt(0.36, 5.2), Pt(0.48, 5.8), L_(22, 92), L_(38, 92))
+    fillPoly(x2, [Pt(0.355, 4.8), Pt(0.485, 5.4), Pt(0.48, 8.2), Pt(0.35, 7.6)], C.dusk)   // 袖口
+    // 枪管、准星座、导气管
+    quad(0, 0.3, 0, 0.9, 1.1, C.dusk); edge(0, 0.3, -0.9, -1.1, C.slate)
+    fillPoly(x2, [Pt(0.035, -0.8), Pt(0.065, -0.8), Pt(0.065, -4), Pt(0.035, -4)], C.ink)
+    quad(0.16, 0.4, -2.4, 0.9, 1.1, C.dusk); edge(0.16, 0.4, -3.3, -3.5, C.slate)
+    // 木护木（上下两段）
+    quad(0.27, 0.52, 0.7, 2.6, 3.6, C.red); edge(0.27, 0.52, -1.9, -2.9, C.orange); edge(0.27, 0.52, 3.3, 4.3, C.plum)
+    edge(0.3, 0.5, 0.2, 0.4, C.plum); edge(0.3, 0.5, 1.4, 1.8, C.plum)
+    quad(0.3, 0.44, -2.7, 1.2, 1.5, C.red); edge(0.3, 0.44, -3.9, -4.2, C.orange)
+    // 机匣、表尺、防尘盖棱
+    quad(0.5, 1.06, -0.3, 3.8, 6.5, C.dusk); edge(0.5, 1.06, -4.1, -6.8, C.slate); edge(0.5, 1.06, 3.5, 6.2, C.ink)
+    fillPoly(x2, [Pt(0.5, -4.1), Pt(0.57, -4.4), Pt(0.57, -6.4), Pt(0.5, -5.8)], C.ink)
+    for (const t of [0.86, 0.9, 0.94, 0.98]) edge(t, t + 0.005, -4.5, -1.5, C.ink)
+    // 弯弹匣
+    const A = Pt(0.56, 3.6), B = Pt(0.68, 4.4)
+    const Bm = [B[0] + (n[0] * 8 - d[0] * 2) * vmS, B[1] + (n[1] * 8 - d[1] * 2) * vmS], Bz = [B[0] + (n[0] * 16 - d[0] * 7) * vmS, B[1] + (n[1] * 16 - d[1] * 7) * vmS]
+    const Am = [A[0] + (n[0] * 8 - d[0] * 4) * vmS, A[1] + (n[1] * 8 - d[1] * 4) * vmS], Az = [A[0] + (n[0] * 15 - d[0] * 10) * vmS, A[1] + (n[1] * 15 - d[1] * 10) * vmS]
+    fillPoly(x2, [A, B, Bm, Bz, Az, Am], (x, y) => dith(x, y, 0.12) ? C.dusk : C.ink)
+    x2.fillStyle = C.dusk
+    for (let i = 0; i <= 10; i++) { const k = i / 10, p = [A[0] + (Am[0] - A[0]) * k * 2, A[1] + (Am[1] - A[1]) * k * 2]; if (k <= 0.5) x2.fillRect(R(p[0]), R(p[1]), 1, 1) }
+    // 左手手套握住护木，手指搭在上面
+    fillPoly(x2, [Pt(0.35, 1.2), Pt(0.49, 1.8), Pt(0.5, 6.2), Pt(0.34, 5.6)], C.ink)
+    for (const t of [0.37, 0.41, 0.45]) fillPoly(x2, [Pt(t, -2.2), Pt(t + 0.03, -2.4), Pt(t + 0.03, 1.4), Pt(t, 1.4)], C.dusk)
+    edge(0.35, 0.49, 5.6, 6.2, C.dusk)
+    // 右手握把 + 袖子
+    arm(Pt(0.83, 9.5), Pt(0.96, 10.5), L_(82, 92), L_(100, 92))
+    fillPoly(x2, [Pt(0.82, 4.8), Pt(0.96, 5.8), Pt(0.95, 11), Pt(0.8, 10)], C.ink)
+    edge(0.82, 0.95, 10, 11, C.dusk)
+
+    VM = c
+    vmGeo = { BW, BH, muzzle: Pt(-0.02, 0), port: Pt(0.74, -4.5), d }
+  }
+
+  // ---------- 敌人：「匪徒」模板（身高 40 个单位的多边形，脚底中心为原点、面朝右），按身高缩放后逐像素填充 ----------
+  // 每项 [颜色, 点列]；part 用来标记命中区域和姿势变形
+  const TPL = [
+    ['dusk', [[-3.2, -16], [0.2, -16], [0.4, -2], [-2.6, -2]], 'leg'],                       // 后腿
+    ['ink', [[-3, -2], [0.6, -2], [1.2, 0], [-3, 0]], 'leg'],
+    ['navy', [[-0.2, -16], [3.4, -16], [3, -9], [3.6, -2], [0.6, -2], [0.4, -9]], 'leg'],     // 前腿
+    ['slate', [[0.3, -10.2], [3.4, -10.2], [3.4, -8.2], [0.3, -8.2]], 'leg'],                // 护膝
+    ['ink', [[0.4, -2], [4.6, -2], [4.8, 0], [0.4, 0]], 'leg'],                              // 靴子
+    ['teal', [[-2.6, -29], [-0.6, -29.6], [3.2, -25.6], [9, -25], [9, -23.4], [2.4, -23.8]], 'arm'],   // 后臂伸向护木
+    ['green', [[-4.6, -30.4], [4, -30.4], [3.6, -16], [-3.8, -16]], 'body'],                  // 夹克
+    ['teal', [[-4.6, -30.4], [-2.4, -30.4], [-2, -16], [-3.8, -16]], 'body'],                 // 背光一侧
+    ['dusk', [[-3.4, -28.6], [3.4, -28.6], [3.1, -19], [-3, -19]], 'body'],                   // 战术背心
+    ['slate', [[-2.4, -23], [-0.6, -23], [-0.6, -20], [-2.4, -20]], 'body'],                  // 弹匣包
+    ['slate', [[0.4, -23], [2.2, -23], [2.2, -20], [0.4, -20]], 'body'],
+    ['ink', [[-3.8, -17.2], [3.6, -17.2], [3.6, -16], [-3.8, -16]], 'body'],                  // 腰带
+    ['red', [[-0.6, -25.9], [1.5, -26.2], [1.5, -24.4], [-0.6, -24.2]], 'gun'],               // 枪托（抵在肩上）
+    ['dusk', [[1.5, -26.6], [7.6, -26.6], [7.6, -24.6], [1.5, -24.4]], 'gun'],                // 机匣
+    ['ink', [[5.2, -24.6], [7.2, -24.6], [6.8, -21.6], [5.2, -20.2], [4.4, -21]], 'gun'],     // 弯弹匣
+    ['red', [[7.6, -26.4], [11, -26.4], [11, -24.9], [7.6, -24.7]], 'gun'],                   // 护木
+    ['slate', [[11, -26], [15.5, -26], [15.5, -25.3], [11, -25.3]], 'gun'],                   // 枪管
+    ['ink', [[14.6, -26.8], [15.2, -26.8], [15.2, -26], [14.6, -26]], 'gun'],                 // 准星
+    ['orange', [[8.4, -25.2], [10, -25.2], [10, -23.6], [8.4, -23.6]], 'arm'],                // 托护木的手
+    ['green', [[1.4, -30], [4.2, -29.4], [4.8, -23.4], [2.6, -23]], 'arm'],                   // 前臂（大臂）
+    ['green', [[2.6, -24], [4.8, -23.6], [6.2, -25.2], [4.6, -26]], 'arm'],                   // 前臂（小臂）
+    ['orange', [[4.6, -26.2], [6.4, -26.2], [6.4, -24.2], [4.6, -24.2]], 'arm'],              // 扣扳机的手
+    ['orange', [[-0.8, -31.4], [1.4, -31.4], [1.4, -30.2], [-0.8, -30.2]], 'neck'],          // 脖子
+    ['fog', [[-3.6, -33.4], [-2, -33], [-2.4, -28.6], [-4.4, -29.2]], 'head'],                // 头巾垂下来的尾巴
+  ]
+  const HEAD = { x: 0.4, y: -34.6, rx: 3.6, ry: 4.4 }
+  function tParts(fx, fy, h, face) {
+    const u = h / 40
+    return {
+      u,
+      head: { cx: fx + face * HEAD.x * u, cy: fy + HEAD.y * u, rx: Math.max(1.6, HEAD.rx * u), ry: Math.max(2, HEAD.ry * u) },
+      torso: { x: R(fx + (face > 0 ? -4.6 : -4) * u), y: R(fy - 30.4 * u), w: Math.max(3, R(8.6 * u)), h: R(14.4 * u) },
+      legs: { x: R(fx + (face > 0 ? -3.2 : -4.8) * u), y: R(fy - 16 * u), w: Math.max(2, R(8 * u)), h: R(16 * u) },
+      gunY: R(fy - 25.6 * u),
+    }
+  }
+  function rect(x, y, w, h, col) {
+    if (w < 0) { x += w; w = -w }
+    g.fillStyle = col; g.fillRect(R(x), R(y), Math.max(1, R(w)), Math.max(1, R(h)))
+  }
+  // pose：stand 站立；crouch 中弹后蹲下（上身下沉、腿压短）；dead 向后倒地
+  function drawT(fx, fy, h, face, pose, ox, oy, tint) {
+    fx -= ox; fy -= oy
+    const u = h / 40
+    const map = (x, y) => {
+      if (pose === 'crouch') y = y < -16 ? y + 6 : y * 0.62
+      if (pose === 'dead') return [fx - face * (-y) * u * 0.95, fy - (x + 5) * u * 0.55]
+      return [fx + face * x * u, fy + y * u]
+    }
+    for (const [col, pts, part] of TPL) {
+      if (pose === 'dead' && part === 'gun') continue
+      fillPoly(g, pts.map(([x, y]) => map(x, y)), tint || C[col])
+    }
+    // 头：白头巾，背光一侧灰，脸露出一条，两只眼睛；头巾上一道褶
+    const [hx, hy2] = map(HEAD.x, HEAD.y)
+    const rx = Math.max(1.6, HEAD.rx * u), ry = Math.max(2, HEAD.ry * u)
+    const erx = pose === 'dead' ? ry * 0.6 : rx, ery = pose === 'dead' ? rx * 0.7 : ry
+    for (let y = Math.floor(hy2 - ery); y <= Math.ceil(hy2 + ery); y++) for (let x = Math.floor(hx - erx); x <= Math.ceil(hx + erx); x++) {
+      const nx = (x + 0.5 - hx) / erx, ny = (y + 0.5 - hy2) / ery
+      if (nx * nx + ny * ny > 1) continue
+      let c = nx * face < -0.25 ? C.fog : C.white
+      if (pose !== 'dead') {
+        if (nx * face > -0.1 && ny > -0.2 && ny < 0.3) c = C.orange               // 露出的脸
+        else if (Math.abs(ny + 0.55) < 0.12 && u >= 1) c = C.fog                   // 头巾的褶
+      }
+      g.fillStyle = tint || c; g.fillRect(x, y, 1, 1)
+    }
+    if (!tint && pose !== 'dead' && u >= 0.7) {
+      rect(hx + face * 1.2 * u, hy2 - 0.3 * u, 1, 1, C.ink)
+      if (u >= 1.2) rect(hx + face * 2.6 * u, hy2 - 0.3 * u, 1, 1, C.ink)
+    }
   }
 
   // ---------- 架点 ----------
-  // L：门洞左沿；R：门洞右沿；C：箱子上沿。marker 是该架的头部位置
-  const angleInfo = a => {
-    const headY = ground - EH + 3
-    if (a === 'L') return { marker: { x: door.x + 5, y: headY } }
-    if (a === 'R') return { marker: { x: door.x + door.w - 6, y: headY } }
-    return { marker: { x: crate.x + Math.round(crate.w * 0.3) + 4, y: crate.y - 7 } }
+  // door：远处门缝，从左扇门后面往右探；crate：中距离木箱，从箱子左边往左探；pillar：近处石柱，从柱子右边往右探
+  const ANGLES = ['door', 'crate', 'pillar']
+  function angleGeo(a) {
+    const h = EH[a], u = h / 40
+    if (a === 'door') return { h, u, face: 1, fy: gy, hide: gap.x - Math.ceil(15 * u) - 1, peek: gap.x + 4.5 * u }
+    if (a === 'crate') return { h, u, face: -1, fy: floorMid, hide: crate.x + Math.ceil(15 * u) + 1, peek: crate.x - crateSide - 5 * u }
+    return { h, u, face: 1, fy: floorNear, hide: pillar.r + sideW - Math.ceil(15 * u) - 1, peek: pillar.r + sideW + 5 * u }
   }
-  // 当前探头程度 p∈[0,1] 时精灵左上角位置和朝向
-  function enemyPos(rd, p) {
-    if (rd.angle === 'L') return { x: Math.round(door.x - EW + (EW + rd.peek) * p), y: ground - EH, face: 'right' }
-    if (rd.angle === 'R') return { x: Math.round(door.x + door.w - (EW + rd.peek) * p), y: ground - EH, face: 'left' }
-    const ex = crate.x + Math.round(crate.w * 0.3) + rd.shift
-    return { x: ex, y: Math.round(crate.y + 1 - (11 + rd.peek) * p), face: rd.shift > 0 ? 'left' : 'right' }
+  const visible = (a, x, y) =>
+    a === 'door' ? x >= gap.x && x < gap.r && y >= door.y && y < gy
+      : a === 'crate' ? x < crate.x - crateSide
+        : x >= pillar.r + sideW
+  function markerOf(a) {
+    const G = angleGeo(a), fx = G.peek + G.face * 2 * G.u
+    const hd = tParts(fx, G.fy, G.h, G.face).head
+    return { x: hd.cx, y: hd.cy }
   }
-  // 敌人可见区域：门洞内，或箱子上沿以上
-  const visible = (rd, x, y) => rd.angle === 'C' ? y < crate.y : inDoor(Math.floor(x), Math.floor(y))
-  function hitTest(rd, pos, x, y) {
-    if (!visible(rd, x, y)) return null
-    const lx = x - pos.x, ly = y - pos.y
-    const head = { x: 1.5, y: -0.5, w: 6, h: 7 }                          // 头：第 2–6 列、0–5 行，外扩半像素
-    const body = pos.face === 'right' ? { x: 0, y: 6, w: 8, h: 16 } : { x: 1, y: 6, w: 8, h: 16 }
-    if (inRect(lx, ly, head)) return 'head'
-    if (inRect(lx, ly, body)) return 'body'
+  function enemyFx(rd, p) { const G = angleGeo(rd.angle); return G.hide + (G.peek + G.face * rd.peekD * G.u - G.hide) * p }
+  function hitTest(rd, fx, x, y) {
+    if (!visible(rd.angle, x, y)) return null
+    const G = angleGeo(rd.angle), t = tParts(fx, G.fy, G.h, G.face), hd = t.head
+    const nx = (x - hd.cx) / (hd.rx + 0.6), ny = (y - hd.cy) / (hd.ry + 0.6)
+    if (nx * nx + ny * ny <= 1) return 'head'
+    if (inRect(x, y, { x: t.torso.x - 0.5, y: t.torso.y - 0.5, w: t.torso.w + 1, h: t.torso.h + 1 })) return 'body'
+    if (inRect(x, y, { x: t.legs.x - 0.5, y: t.legs.y, w: t.legs.w + 1, h: t.legs.h })) return 'body'
     return null
   }
 
   // ---------- 状态 ----------
-  let state = 'ready'           // ready | play | over
+  let state = 'ready'           // ready | play | dying | over
   let phase = 'place'           // place | hold | peek | after
-  let ri = 0, rd = null, rounds = [], score = 0
-  let kickUntil = 0, insideSince = 0
-  let fx = [], result = null, btnRect = null, muteRect = null, exitRect = null, lastAngle = []
+  let rd = null, kills = 0, score = 0, heads = 0, rts = [], stabs = []
+  let hp = 100, clip = 30, reserve = 90, reloadAt = 0, spread = 0, lastShot = 0, insideSince = 0
+  let fx = [], decals = [], feed = [], shells = [], result = null, btnRect = null, muteRect = null, exitRect = null
+  let lastAngle = [], dmgAt = 0, sway = { x: 0, y: 0 }, camPrev = { x: 0, y: 0 }
 
-  function newRound() {
-    const pool = ['L', 'R', 'C'].filter(a => !(lastAngle[0] === a && lastAngle[1] === a))   // 同一架点不连着来三次
+  function newRound(now) {
+    const pool = ANGLES.filter(a => !(lastAngle[0] === a && lastAngle[1] === a))   // 同一架点不连着来三次
     const angle = pool[Math.floor(Math.random() * pool.length)]
     lastAngle = [angle, lastAngle[0]]
-    rd = {
-      angle,
-      peek: Math.round(angle === 'C' ? rand(0, 3) : rand(3, 10)),   // 探出多少像素：每回合位置略有不同，要微调
-      shift: Math.round(rand(-4, 4)),
-      delay: rand(900, 3500),
-      samples: [], result: null, rt: 0, stab: 0, pts: 0,
-    }
-    phase = 'place'
-    insideSince = 0
+    rd = { angle, peekD: rand(0, 4), delay: rand(800, 3200), ttk: ttkFor(kills), samples: [], early: false }
+    phase = 'place'; insideSince = 0
+    if (clip < 6 && reserve > 0 && !reloadAt) startReload(now)
   }
-
   function start() {
+    const now = performance.now()
     state = 'play'
-    ri = 0; score = 0; rounds = []; fx = []; lastAngle = []
-    newRound()
+    kills = score = heads = 0; rts = []; stabs = []
+    hp = 100; clip = 30; reserve = 90; reloadAt = 0; spread = 0
+    fx = []; decals = []; feed = []; shells = []; lastAngle = []
+    newRound(now)
   }
-
-  function finishRound(res, now, hitPos) {
-    rd.result = res
-    if (rd.samples.length > 2) {
-      const n = rd.samples.length
-      const mx = rd.samples.reduce((a, p) => a + p.x, 0) / n, my = rd.samples.reduce((a, p) => a + p.y, 0) / n
-      const jitter = Math.sqrt(rd.samples.reduce((a, p) => a + (p.x - mx) ** 2 + (p.y - my) ** 2, 0) / n)
-      const m = angleInfo(rd.angle).marker, last = rd.samples[n - 1]
-      const drift = Math.hypot(last.x - m.x, last.y - m.y)
-      rd.stab = Math.round(Math.max(0, Math.min(100, 100 - jitter * 30 - Math.max(0, drift - 3) * 8)))
-    }
-    if (res === 'head' || res === 'body') {
-      rd.pts = (res === 'head' ? 150 : 100) + Math.round(Math.max(0, Math.min(1, (700 - rd.rt) / 500)) * 100) + Math.round(rd.stab / 2)
-      rd.deadAt = now; rd.deadPos = hitPos
-    }
-    score += rd.pts
-    rounds.push(rd)
-    phase = 'after'
-    rd.afterAt = now
+  function startPeek(now, early) {
+    phase = 'peek'; rd.peekAt = now; rd.early = early
+    if (early) rd.ttk = R(rd.ttk * 0.6)   // 开枪暴露了位置：敌人预瞄着拉出来，更快
+    computeStab()
   }
-
+  function computeStab() {
+    const s = rd.samples, n = s.length
+    if (n < 3) return
+    const mx = s.reduce((a, p) => a + p.x, 0) / n, my = s.reduce((a, p) => a + p.y, 0) / n
+    const jitter = Math.sqrt(s.reduce((a, p) => a + (p.x - mx) ** 2 + (p.y - my) ** 2, 0) / n)
+    const m = markerOf(rd.angle), last = s[n - 1]
+    const drift = Math.hypot(last.x - m.x, last.y - m.y)
+    rd.stab = R(Math.max(0, Math.min(100, 100 - jitter * 30 - Math.max(0, drift - 3) * 8)))
+    stabs.push(rd.stab)
+  }
+  function killEnemy(now, part, fxPos) {
+    const rt = R(now - rd.peekAt)
+    rd.result = part; rd.rt = rt; rd.deadAt = now; rd.deadFx = fxPos
+    kills++; if (part === 'head') heads++
+    rts.push(rt)
+    score += 100 + (part === 'head' ? 50 : 0) + R(Math.max(0, (rd.ttk - rt) / rd.ttk) * 100) + R((rd.stab || 0) / 2)
+    feed.unshift({ t: now, killer: 'YOU', victim: 'T', hs: part === 'head', mine: true })
+    phase = 'after'; rd.afterAt = now
+  }
+  function die(now, cause) {
+    state = 'dying'; rd.dieAt = now; rd.cause = cause
+    hp = 0; dmgAt = now
+    feed.unshift({ t: now, killer: 'T', victim: 'YOU', hs: Math.random() < 0.5, mine: false })
+    audio.noise(0.05, 0.08); audio.noise(0.05, 0.08, 0.09); audio.noise(0.05, 0.08, 0.18)
+    audio.note(-22, 0.25, 'triangle', 0.09, 0.05)
+    P.unlock()
+  }
   function end() {
     state = 'over'
-    const hits = rounds.filter(r => r.result === 'head' || r.result === 'body')
-    const heads = rounds.filter(r => r.result === 'head').length
-    const held = rounds.filter(r => r.samples.length > 2)
     const best = json(KEY_BEST)
-    const isRec = score > 0 && (!best || score > best.score)
-    const rank = rankOf(score)
-    if (isRec) store.set(KEY_BEST, JSON.stringify({ score, rank: rank[1] }))
-    P.unlock()
+    const isRec = kills > 0 && (!best || score > best.score)
+    const rank = rankOf(kills)
+    if (isRec) store.set(KEY_BEST, JSON.stringify({ score, kills, rank: rank[1] }))
     result = {
-      score, rank, isRec, best, at: performance.now(),
-      hits: hits.length,
-      rt: hits.length ? Math.round(hits.reduce((a, r) => a + r.rt, 0) / hits.length) : 0,
-      hs: hits.length ? Math.round(heads / hits.length * 100) : 0,
-      stab: held.length ? Math.round(held.reduce((a, r) => a + r.stab, 0) / held.length) : 0,
+      kills, score, rank, isRec, best, at: performance.now(), cause: rd.cause, ttk: rd.ttk,
+      rt: rts.length ? R(rts.reduce((a, b) => a + b, 0) / rts.length) : 0,
+      hs: kills ? R(heads / kills * 100) : 0,
+      stab: stabs.length ? R(stabs.reduce((a, b) => a + b, 0) / stabs.length) : 0,
     }
-    audio.arp([0, 4, 7, 12, 7, 12], 0.07)
-    if (isRec) audio.arp([16, 19, 24], 0.08)
+    audio.arp([12, 7, 4, 0], 0.09)
+  }
+  function startReload(now) {
+    if (reloadAt || reserve <= 0 || clip >= 30) return
+    reloadAt = now
+    audio.note(2, 0.04, 'square', 0.03); audio.note(-3, 0.05, 'square', 0.03, 0.9); audio.note(7, 0.04, 'square', 0.04, 1.7)
   }
 
   // ---------- 输入 ----------
   P.onDown(({ x, y }) => {
     audio.unlock()
     const now = performance.now()
-
-    if (inRect(x, y, exitRect)) { audio.note(0, 0.05); PK.goHome(); return }
-    if (state !== 'play' && inRect(x, y, muteRect)) { audio.toggle(); return }
+    if (!P.locked && inRect(x, y, exitRect)) { audio.note(0, 0.05); PK.goHome(); return }
     if (state === 'ready' || state === 'over') {
-      if (inRect(x, y, btnRect) && (state === 'ready' || now - result.at > 400)) { P.lock(); audio.arp([0, 4, 7, 12], 0.045); start() }
+      if (inRect(x, y, muteRect)) { audio.toggle(); return }
+      if (inRect(x, y, btnRect) && (state === 'ready' || now - result.at > 500)) { P.lock(); audio.arp([0, 4, 7, 12], 0.045); start() }
       return
     }
+    if (state !== 'play') return
     if (P.wantsLock()) { P.lock(); return }   // 中途按 ESC 解锁了：这一下只用来重新锁定，不算开枪
-    if (phase === 'place' || phase === 'after') return
-
-    // 开枪
-    kickUntil = now + 80
-    audio.noise(0.07, 0.09)
-    audio.note(-24, 0.07, 'square', 0.05)
-    if (phase === 'hold') { finishRound('early', now); return }
-    const t = now - rd.peekAt
-    const pos = enemyPos(rd, peekP(t))
-    const hit = hitTest(rd, pos, x, y)
-    rd.rt = Math.round(t)
-    if (hit) {
-      finishRound(hit, now, pos)
-      burst(x, y)
-      if (hit === 'head') { audio.note(24, 0.06, 'square', 0.05, 0.02); audio.note(31, 0.12, 'triangle', 0.06, 0.05) }   // 爆头「叮」
-      else audio.note(-12, 0.08, 'triangle', 0.09, 0.02)
-    } else {
-      finishRound('miss', now)
-      fx.push({ k: 'miss', x: Math.round(x), y: Math.round(y), t: now })
-      audio.noise(0.05, 0.03, 0.04)
-    }
+    shoot(now)
   })
+  addEventListener('keydown', e => { if ((e.key === 'r' || e.key === 'R') && state === 'play') startReload(performance.now()) })
 
-  // 探头进度：分 3 步探出（像素风的逐帧感），停留，再缩回
-  function peekP(t) {
-    const W = exposure(ri)
-    if (t < SLIDE) return Math.ceil((t / SLIDE) * 3) / 3
-    if (t < SLIDE + W) return 1
-    if (t < SLIDE + W + RETREAT) return 1 - Math.ceil(((t - SLIDE - W) / RETREAT) * 3) / 3
-    return 0
+  function shoot(now) {
+    if (reloadAt) return
+    if (clip <= 0) { audio.note(22, 0.02, 'square', 0.02); startReload(now); return }
+    clip--
+    lastShot = now
+    // 第一枪准，连续开枪散布变大（每枪 +2.2 像素，停手后每秒恢复 12 像素）
+    const a = Math.random() * Math.PI * 2, r = Math.random() * spread
+    const wx = cam.x + Math.cos(a) * r, wy = cam.y + Math.sin(a) * r
+    spread = Math.min(9, spread + 2.2)
+    audio.noise(0.09, 0.12); audio.note(-26, 0.08, 'square', 0.06)
+    if (!RM) shells.push({ t: now, vx: rand(30, 55), vy: rand(-70, -45) })
+    if (clip === 0) setTimeout(() => startReload(performance.now()), 250)
+
+    if (phase === 'hold' || phase === 'place') {               // 敌人还没出来就开枪：暴露位置
+      addDecal(wx, wy, now)
+      if (phase === 'hold') startPeek(now, true)
+      return
+    }
+    if (phase !== 'peek') { addDecal(wx, wy, now); return }
+    const fxPos = enemyFx(rd, peekP(now - rd.peekAt))
+    const hit = hitTest(rd, fxPos, wx, wy)
+    if (hit) {
+      killEnemy(now, hit, fxPos)
+      blood(wx, wy, now)
+      if (hit === 'head') { audio.note(27, 0.05, 'square', 0.04, 0.03); audio.note(34, 0.15, 'triangle', 0.05, 0.05) }   // 爆头「叮」
+      else audio.note(-14, 0.07, 'triangle', 0.08, 0.02)
+    } else addDecal(wx, wy, now)
   }
+  const peekP = t => Math.min(1, Math.ceil((t / SLIDE) * 3) / 3)
 
-  function burst(x, y) {
+  function addDecal(wx, wy, now) {
+    if (wy < far.y - R(H * 0.1) && !(wx < pillar.r + sideW && wx >= pillar.x)) { /* 打到天上 */ }
+    else { decals.push({ x: R(wx), y: R(wy) }); if (decals.length > 40) decals.shift() }
     if (RM) return
-    const now = performance.now()
-    for (let i = 0; i < 8; i++) fx.push({ k: 'blood', x, y, vx: rand(-40, 40), vy: rand(-50, 10), t: now })
+    for (let i = 0; i < 5; i++) fx.push({ k: 'dust', x: wx, y: wy, vx: rand(-25, 25), vy: rand(-40, -5), t: now })
+  }
+  function blood(wx, wy, now) {
+    if (RM) return
+    for (let i = 0; i < 10; i++) fx.push({ k: 'blood', x: wx, y: wy, vx: rand(-45, 45), vy: rand(-55, 10), t: now })
   }
 
   // ---------- 逐帧逻辑 ----------
-  function update(now) {
+  function update(now, dt) {
+    spread = Math.max(0, spread - dt * 0.012)
+    if (reloadAt && now - reloadAt >= RELOAD) { const n = Math.min(30 - clip, reserve); clip += n; reserve -= n; reloadAt = 0 }
+    if (!P.locked && (state === 'play' || state === 'dying')) { cam.x = WC.x + (P.x - W / 2); cam.y = WC.y + (P.y - H / 2); clampCam() }   // 没锁定：光标偏离中心多少，视角就转多少
+    if (state === 'ready' || state === 'over') { cam.x = WC.x + (RM ? 0 : Math.sin(now / 2400) * 3); cam.y = WC.y }
+
+    if (state === 'dying' && now - rd.dieAt > 1300) end()
     if (state !== 'play') return
     if (phase === 'place') {
-      const m = angleInfo(rd.angle).marker
-      if (Math.hypot(P.x - m.x, P.y - m.y) <= ZONE) {
+      const m = markerOf(rd.angle)
+      if (Math.hypot(cam.x - m.x, cam.y - m.y) <= ZONE) {
         if (!insideSince) insideSince = now
         if (now - insideSince >= 300) { phase = 'hold'; rd.holdAt = now; audio.note(12, 0.03, 'triangle', 0.03) }
       } else insideSince = 0
     } else if (phase === 'hold') {
-      rd.samples.push({ x: P.x, y: P.y })
-      if (now - rd.holdAt >= rd.delay) { phase = 'peek'; rd.peekAt = now }
+      rd.samples.push({ x: cam.x, y: cam.y })
+      if (now - rd.holdAt >= rd.delay) startPeek(now, false)
     } else if (phase === 'peek') {
-      const t = now - rd.peekAt
-      if (t >= SLIDE + exposure(ri) + RETREAT) { rd.rt = 0; finishRound('slow', now) }
+      if (now - rd.peekAt >= rd.ttk) die(now, rd.early ? 'early' : 'slow')
     } else if (phase === 'after') {
-      if (now - rd.afterAt >= 800) {
-        ri++
-        if (ri >= ROUNDS) end()
-        else newRound()
-      }
+      if (now - rd.afterAt >= 700) newRound(now)
     }
   }
 
-  // ---------- 绘制 ----------
-  function drawEnemy(now) {
-    if (state !== 'play' || !rd) return
-    let pos, spr
+  // ---------- 绘制：世界 ----------
+  function drawEnemyAt(layerAngle, ox, oy, now) {
+    if (!rd || rd.angle !== layerAngle || state === 'ready') return
+    const G = angleGeo(rd.angle)
     if (rd.deadAt) {
       const age = now - rd.deadAt
-      pos = { ...rd.deadPos, y: rd.deadPos.y + (age < 70 ? 0 : Math.min(10, Math.floor((age - 70) / 30))) }
-      spr = age < 70 ? (pos.face === 'right' ? SPR.flashR : SPR.flashL) : (pos.face === 'right' ? SPR.deadR : SPR.deadL)
-    } else if (phase === 'peek' || (phase === 'after' && rd.peekAt)) {
-      const p = peekP(now - rd.peekAt)
-      if (p <= 0) return
-      pos = enemyPos(rd, p)
-      spr = SPR[pos.face]
-    } else return
-    g.drawImage(spr, pos.x, pos.y)
+      if (age > 700) return
+      const pose = age < 60 ? 'stand' : age < 180 ? 'crouch' : 'dead'
+      drawT(rd.deadFx, G.fy, G.h, G.face, pose, ox, oy, age < 60 ? C.white : null)
+      return
+    }
+    if (phase !== 'peek' && state !== 'dying') return
+    const p = peekP(now - rd.peekAt)
+    drawT(enemyFx(rd, p), G.fy, G.h, G.face, 'stand', ox, oy)
+    // 打死你的时候：枪口连闪
+    if (state === 'dying' && Math.floor((now - rd.dieAt) / 60) % 2 === 0 && now - rd.dieAt < 400) {
+      const fx1 = enemyFx(rd, 1), mx = fx1 + G.face * 15.8 * G.u - ox, my = G.fy - 25.8 * G.u - oy
+      rect(mx, my - 1, G.face * 2, 3, C.gold); rect(mx + G.face, my, G.face * 2, 1, C.white)
+    }
   }
-
-  function drawScene(now) {
-    const behindWall = rd && rd.angle !== 'C'
-    g.drawImage(layers.bg, 0, 0)
-    if (behindWall) drawEnemy(now)
-    g.drawImage(layers.wall, 0, 0)
-    if (!behindWall) drawEnemy(now)
-    g.drawImage(layers.crate, 0, 0)
-    // 场景描边
-    g.fillStyle = C.dusk
-    g.fillRect(scene.x - 1, scene.y - 1, scene.w + 2, 1); g.fillRect(scene.x - 1, scene.y + scene.h, scene.w + 2, 1)
-    g.fillRect(scene.x - 1, scene.y, 1, scene.h); g.fillRect(scene.x + scene.w, scene.y, 1, scene.h)
-  }
-
-  function drawMarker(now) {
-    if (state !== 'play' || phase !== 'place') return
-    const m = angleInfo(rd.angle).marker
-    const inside = insideSince > 0
-    if (!inside && !RM && Math.floor(now / 300) % 2) return
-    ring(m.x, m.y, ZONE, C.ink)
-    ring(m.x, m.y, ZONE - 1, inside ? C.lime : C.white)
-    g.fillStyle = inside ? C.lime : C.white
-    g.fillRect(m.x, m.y, 1, 1)
-  }
-
-  const LIFE = { blood: 450, miss: 320 }
-  function drawFx(now) {
-    fx = fx.filter(f => now - f.t < LIFE[f.k])
+  function drawWorld(now, ox, oy) {
+    g.drawImage(layers.bg, -ox, -oy)
+    drawEnemyAt('door', ox, oy, now)
+    g.drawImage(layers.door, -ox, -oy)
+    drawEnemyAt('crate', ox, oy, now)
+    g.drawImage(layers.crate, -ox, -oy)
+    drawEnemyAt('pillar', ox, oy, now)
+    g.drawImage(layers.pillar, -ox, -oy)
+    for (const d of decals) { rect(d.x - ox, d.y - oy, 1, 1, C.ink); g.fillStyle = C.plum; g.fillRect(d.x - ox + 1, d.y - oy, 1, 1) }
+    // 粒子
+    fx = fx.filter(f => now - f.t < 500)
     for (const f of fx) {
-      const age = now - f.t, s = age / 1000
-      if (f.k === 'blood') {
-        g.fillStyle = age < 200 ? C.red : C.plum
-        g.fillRect(Math.round(f.x + f.vx * s), Math.round(f.y + f.vy * s + 160 * s * s), 1, 1)
-      } else if (f.k === 'miss') {
-        if (Math.floor(age / 60) % 2) continue
-        g.fillStyle = C.ink
-        g.fillRect(f.x, f.y, 1, 1)
+      const s = (now - f.t) / 1000
+      g.fillStyle = f.k === 'blood' ? (s < 0.2 ? C.red : C.plum) : (s < 0.15 ? C.white : C.fog)
+      g.fillRect(R(f.x + f.vx * s - ox), R(f.y + f.vy * s + 140 * s * s - oy), 1, 1)
+    }
+    // 架点标记（只在「就位」阶段）
+    if (state === 'play' && phase === 'place') {
+      const m = markerOf(rd.angle), mx = R(m.x - ox), my = R(m.y - oy), inside = insideSince > 0
+      if (inside || RM || Math.floor(now / 300) % 2 === 0) {
+        ring(mx, my, ZONE + 1, C.ink); ring(mx, my, ZONE, inside ? C.lime : C.white)
+      }
+      // 标记在屏幕外时，在边缘画个箭头指过去
+      if (mx < 4 || mx > W - 4 || my < 4 || my > H - 4) {
+        const ax = Math.max(6, Math.min(W - 7, mx)), ay = Math.max(30, Math.min(H - 40, my))
         g.fillStyle = C.white
-        g.fillRect(f.x - 1, f.y - 1, 1, 1); g.fillRect(f.x + 1, f.y + 1, 1, 1); g.fillRect(f.x + 1, f.y - 1, 1, 1)
+        g.fillRect(ax - 1, ay - 1, 3, 3)
+        g.fillStyle = C.ink; g.fillRect(ax, ay, 1, 1)
       }
     }
   }
 
-  function drawHud() {
-    const y = HY
-    icon('star', 4, y + 4, C.gold)
-    btext(score, 13, y + 5, C.gold)
-    btext(`${Math.min(ri + 1, ROUNDS)}/${ROUNDS}`, Math.floor(S.W / 2), y + 3, C.white, 2, 'center')
-    const last = rounds[rounds.length - 1]
-    icon('clock', S.W - 11, y + 4, C.cyan)
-    btext(last && last.rt && (last.result === 'head' || last.result === 'body') ? last.rt + 'MS' : '--', S.W - 14, y + 5, C.cyan, 1, 'right')
-    // 回合进度点
-    for (let i = 0; i < ROUNDS; i++) {
-      const r = rounds[i]
-      g.fillStyle = !r ? (i === ri ? C.fog : C.dusk) : r.result === 'head' ? C.gold : r.result === 'body' ? C.lime : C.red
-      g.fillRect(Math.floor(S.W / 2) - ROUNDS * 2 + i * 4, y + 16, 3, 2)
+  // ---------- 绘制：持枪 ----------
+  function drawViewmodel(now) {
+    const vx = cam.x - camPrev.x, vy = cam.y - camPrev.y
+    sway.x += (Math.max(-5, Math.min(5, -vx * 0.8)) - sway.x) * 0.2
+    sway.y += (Math.max(-4, Math.min(4, -vy * 0.8)) - sway.y) * 0.2
+    const bob = RM ? 0 : Math.sin(now / 700) * 0.8
+    const k = Math.max(0, 1 - (now - lastShot) / 120)                   // 后坐：开枪瞬间往后下方顶，120ms 回位
+    const lower = reloadAt ? Math.sin(Math.min(1, (now - reloadAt) / RELOAD) * Math.PI) * 26 * vmS : 0
+    const x = R(W - vmGeo.BW * vmS + sway.x + vmGeo.d[0] * k * 3 * vmS)
+    const y = R(H - vmGeo.BH * vmS + sway.y + bob + vmGeo.d[1] * k * 3 * vmS + k * vmS + lower)
+    g.drawImage(VM, x, y)
+    // 枪口火焰
+    if (now - lastShot < 45 && !reloadAt) {
+      const mx = x + vmGeo.muzzle[0], my = y + vmGeo.muzzle[1], s = Math.max(1, R(vmS))
+      g.fillStyle = C.gold
+      g.fillRect(R(mx - 4 * s), R(my - 1 * s), 6 * s, 3 * s); g.fillRect(R(mx - 2 * s), R(my - 3 * s), 2 * s, 7 * s)
+      g.fillStyle = C.white
+      g.fillRect(R(mx - 2 * s), R(my), 3 * s, s)
+      g.fillStyle = C.orange
+      g.fillRect(R(mx - 6 * s), R(my), 2 * s, s); g.fillRect(R(mx - 1 * s), R(my - 5 * s), s, 2 * s)
+    }
+    // 抛壳
+    shells = shells.filter(sh => now - sh.t < 400)
+    for (const sh of shells) {
+      const s = (now - sh.t) / 1000
+      g.fillStyle = C.gold
+      g.fillRect(R(x + vmGeo.port[0] + sh.vx * s), R(y + vmGeo.port[1] + sh.vy * s + 260 * s * s), 2, 1)
     }
   }
 
+  // ---------- 绘制：HUD ----------
+  function textShadow(str, x, y, col, s = 1, align = 'left') { btext(str, x + 1, y + 1, C.ink, s, align); btext(str, x, y, col, s, align) }
+  function drawRadar(now) {
+    const x = 3, y = 3, s = 30
+    g.fillStyle = C.dusk; g.fillRect(x, y, s, s)
+    g.fillStyle = C.ink; g.fillRect(x + 1, y + 1, s - 2, s - 2)
+    g.fillStyle = C.dusk
+    g.fillRect(x + 9, y + 4, 12, 24)        // A 大道
+    g.fillRect(x + 4, y + 18, 6, 9)         // 石柱那边的岔口
+    g.fillStyle = C.navy; g.fillRect(x + 12, y + 3, 6, 2)     // 大门
+    g.fillStyle = C.red; g.fillRect(x + 19, y + 13, 3, 3)    // 箱子
+    // 自己（白色箭头 + 视野）
+    g.fillStyle = C.slate; g.fillRect(x + 13, y + 20, 4, 1); g.fillRect(x + 12, y + 18, 6, 1)
+    g.fillStyle = C.white; g.fillRect(x + 15, y + 23, 1, 3); g.fillRect(x + 14, y + 24, 3, 1)
+    // 被发现的敌人：红点
+    if (rd && state !== 'ready' && (phase === 'peek' || state === 'dying' || (rd.deadAt && now - rd.deadAt < 700))) {
+      const pos = { door: [15, 6], crate: [19, 12], pillar: [10, 18] }[rd.angle]
+      if (rd.deadAt) { g.fillStyle = C.red; g.fillRect(x + pos[0] - 1, y + pos[1] - 1, 1, 1); g.fillRect(x + pos[0] + 1, y + pos[1] + 1, 1, 1); g.fillRect(x + pos[0] + 1, y + pos[1] - 1, 1, 1); g.fillRect(x + pos[0] - 1, y + pos[1] + 1, 1, 1); g.fillRect(x + pos[0], y + pos[1], 1, 1) }
+      else if (Math.floor(now / 150) % 2 === 0 || RM) { g.fillStyle = C.red; g.fillRect(x + pos[0] - 1, y + pos[1] - 1, 3, 3) }
+    }
+  }
+  function drawFeed(now) {
+    let y = 16
+    feed = feed.filter(f => now - f.t < 5000).slice(0, 3)
+    for (const f of feed) {
+      const iconW = 10 + (f.hs ? 7 : 0)
+      const w = btextW(f.killer) + btextW(f.victim) + iconW + 10
+      const x = W - 3 - w
+      g.fillStyle = f.mine ? C.red : C.dusk; g.fillRect(x, y, w, 9)
+      g.fillStyle = C.ink; g.fillRect(x + 1, y + 1, w - 2, 7)
+      let cx = x + 3
+      btext(f.killer, cx, y + 2, f.killer === 'YOU' ? C.sky : C.gold); cx += btextW(f.killer) + 2
+      // AK 小图标
+      g.fillStyle = C.fog; g.fillRect(cx, y + 3, 9, 1); g.fillRect(cx + 3, y + 4, 2, 2); g.fillRect(cx + 6, y + 4, 1, 1)
+      g.fillStyle = C.orange; g.fillRect(cx, y + 3, 2, 2)
+      cx += 11
+      if (f.hs) {   // 爆头图标：脑袋 + 一道
+        g.fillStyle = C.white; g.fillRect(cx + 1, y + 2, 3, 4); g.fillRect(cx, y + 3, 5, 2)
+        g.fillStyle = C.red; g.fillRect(cx + 4, y + 2, 2, 1)
+        cx += 7
+      }
+      btext(f.victim, cx, y + 2, f.victim === 'YOU' ? C.sky : C.gold)
+      y += 11
+    }
+  }
+  function drawHud(now) {
+    drawRadar(now)
+    // 顶部中间：击杀数 + 敌人反应时间
+    const cx = Math.floor(W / 2)
+    g.fillStyle = C.navy; g.fillRect(cx - 12, 3, 24, 11)
+    g.fillStyle = C.blue; g.fillRect(cx - 12, 3, 24, 1)
+    textShadow(kills, cx, 5, C.white, 1, 'center')
+    textShadow('KILLS', cx, 16, C.fog, 1, 'center')
+    textShadow(`${rd ? rd.ttk : ttkFor(kills)}MS`, cx, 23, C.orange, 1, 'center')
+    drawFeed(now)
+    // 左下：血量 + 护甲
+    const by = H - 11, low = hp < 30
+    g.fillStyle = low ? C.red : C.white
+    g.fillRect(4, by + 1, 5, 1); g.fillRect(6, by - 1, 1, 5)
+    textShadow(hp, 12, by - 2, low ? C.red : C.white, 2)
+    g.fillStyle = C.fog; g.fillRect(44, by - 1, 4, 4); g.fillRect(45, by + 3, 2, 1)
+    textShadow(100, 51, by - 2, C.fog, 1)
+    // 右下：弹药
+    const ammoCol = clip === 0 ? C.red : clip < 10 ? C.orange : C.white
+    textShadow(`/${reserve}`, W - 4, by + 1, C.fog, 1, 'right')
+    textShadow(clip, W - 6 - btextW(`/${reserve}`), by - 2, ammoCol, 2, 'right')
+    if (reloadAt) textShadow('RELOADING', W - 4, by - 10, C.orange, 1, 'right')
+  }
+  function plate(text, col, y) {
+    const w = ctext(text, -999, -999, col) + 8   // 先量宽度
+    const x = Math.floor((W - w) / 2)
+    g.fillStyle = C.ink; g.fillRect(x, y - 2, w, 16)
+    ctext(text, Math.floor(W / 2), y, col, { align: 'center' })
+  }
   function drawPrompt(now) {
-    const y = scene.y + scene.h + 6, cx = Math.floor(S.W / 2)
-    if (P.wantsLock()) { if (RM || Math.floor(now / 500) % 2 === 0) ctext('点击画面锁定鼠标', cx, y, C.lime, { align: 'center' }) }
-    else if (phase === 'place') ctext('把准星移进白圈', cx, y, C.white, { align: 'center' })
-    else if (phase === 'hold' || phase === 'peek') ctext('稳住，等他探头', cx, y, C.fog, { align: 'center' })   // 探头时文字不变，免得成了提示
+    const y = 56
+    if (P.wantsLock()) { if (RM || Math.floor(now / 500) % 2 === 0) plate('点击画面锁定鼠标', C.lime, y); return }
+    if (state === 'dying') { plate(rd.cause === 'early' ? '开枪暴露了位置' : '你被击杀了', C.red, y); return }
+    if (phase === 'place') plate('准星对准白圈，稳住', C.white, y)
+    else if (phase === 'hold' || phase === 'peek') plate('稳住，等他探头', C.fog, y)    // 探头时文字不变，免得成了提示
     else if (phase === 'after') {
-      const map = {
-        head: ['爆头', C.gold], body: ['命中', C.lime], miss: ['打空了', C.red],
-        slow: ['太慢了', C.fog], early: ['开枪太早', C.orange],
-      }
-      const [txt, col] = map[rd.result]
-      const w = ctext(txt, cx - (rd.rt && rd.result !== 'slow' && rd.result !== 'early' ? 14 : 0), y, col, { align: 'center', shadow: rd.result === 'head' ? C.red : null })
-      if (rd.rt && rd.result !== 'slow' && rd.result !== 'early') btext(rd.rt + 'MS', cx - 14 + Math.ceil(w / 2) + 4, y + 4, C.white)
+      const txt = rd.result === 'head' ? `爆头  ${rd.rt}ms` : `击杀  ${rd.rt}ms`
+      plate(txt, rd.result === 'head' ? C.gold : C.lime, y)
+    }
+  }
+  function drawDamage(now) {
+    const k = Math.max(0, 1 - (now - dmgAt) / 700)
+    if (k <= 0) return
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const e = Math.min(x, y, W - 1 - x, H - 1 - y) / 14
+      if (e < 1 && dith(x, y, (1 - e) * k * 0.9)) { g.fillStyle = C.red; g.fillRect(x, y, 1, 1) }
     }
   }
 
+  // ---------- 绘制：开始 / 结算 ----------
   function drawReady() {
-    const pw = Math.min(S.W - 12, 124), ph = 112, cx = Math.floor(S.W / 2)
-    const px = Math.floor((S.W - pw) / 2), py = Math.max(4, Math.floor((S.H - ph) / 2))
+    const pw = Math.min(W - 12, 124), ph = 124, cx = Math.floor(W / 2)
+    const px = Math.floor((W - pw) / 2), py = Math.max(36, Math.floor((H - ph) / 2) - 10)
     const best = json(KEY_BEST)
     panel(px, py, pw, ph)
     let y = py + 8
     ctext('架枪训练', cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
     y += 22
-    btext('HOLD THE ANGLE', cx, y, C.slate, 1, 'center')
+    btext('HOLD THE ANGLE · DUST2', cx, y, C.slate, 1, 'center')
     y += 10
     ctext('准星架在点位上稳住', cx, y, C.fog, { align: 'center' })
     y += 15
-    ctext('敌人一露头立刻开枪', cx, y, C.fog, { align: 'center' })
+    ctext('他露头没打死他就输', cx, y, C.fog, { align: 'center' })
     y += 18
-    btext(best ? `BEST ${best.score}` : `${ROUNDS} ROUNDS`, cx, y, C.slate, 1, 'center')
+    btext(best ? `BEST ${best.kills || 0} KILLS` : '650MS → 300MS', cx, y, C.slate, 1, 'center')
     btnRect = button(px + 5, py + ph - 23, pw - 10, '开始')
   }
-
   function drawOver(now) {
-    const r = result, cx = Math.floor(S.W / 2)
-    const pw = Math.min(S.W - 12, 124), ph = 168
-    const px = Math.floor((S.W - pw) / 2), py = Math.max(4, Math.floor((S.H - ph) / 2))
+    const r = result, cx = Math.floor(W / 2)
+    const pw = Math.min(W - 12, 124), ph = 176
+    const px = Math.floor((W - pw) / 2), py = Math.max(36, Math.floor((H - ph) / 2))
     panel(px, py, pw, ph)
-    let y = py + 7
-    ctext('段位', cx, y, C.fog, { align: 'center' })
-    y += 15
+    let y = py + 6
+    ctext(r.cause === 'early' ? '开枪暴露了位置' : `被 ${r.ttk}ms 击杀`, cx, y, C.red, { align: 'center' })
+    y += 16
     ctext(r.rank[1], cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
     y += 21
     btext(r.rank[2], cx, y, C.slate, 1, 'center')
     y += 9
-    btext(r.score, cx, y, C.white, 2, 'center')
+    btext(`${r.kills} KILLS`, cx, y, C.white, 2, 'center')
     y += 13
     if (r.isRec) { if (RM || Math.floor(now / 400) % 2 === 0) ctext('新纪录！', cx, y - 1, C.lime, { align: 'center' }) }
-    else if (r.best) btext(`BEST ${r.best.score}`, cx, y + 3, C.slate, 1, 'center')
+    else if (r.best) btext(`BEST ${r.best.kills || 0} · ${r.score}PTS`, cx, y + 3, C.slate, 1, 'center')
+    else btext(`${r.score}PTS`, cx, y + 3, C.slate, 1, 'center')
     y += 16
     const cw = Math.floor((pw - 14) / 2)
-    const stats = [
-      ['平均反应', r.rt ? r.rt + 'MS' : '--'],
-      ['命中', `${r.hits}/${ROUNDS}`],
-      ['爆头率', r.hits ? r.hs + '%' : '--'],
-      ['稳定度', r.stab + '%'],
-    ]
+    const stats = [['平均反应', r.rt ? r.rt + 'MS' : '--'], ['击杀', String(r.kills)], ['爆头率', r.kills ? r.hs + '%' : '--'], ['稳定度', r.stab + '%']]
     stats.forEach(([label, val], i) => {
       const sx = px + 5 + (i % 2) * (cw + 4), sy = y + Math.floor(i / 2) * 32
       g.fillStyle = C.dusk; g.fillRect(sx, sy, cw, 29)
@@ -473,24 +768,30 @@
     btnRect = button(px + 5, y + 68, pw - 10, '再来一局')
   }
 
+  let lastFrame = performance.now()
   function frame() {
-    const now = performance.now()
-    update(now)
-    g.fillStyle = C.ink
-    g.fillRect(0, 0, S.W, S.H)
-    drawScene(now)
-    drawFx(now)
-    if (state === 'play') { drawHud(); drawMarker(now); drawPrompt(now) }
-    else if (state === 'ready') drawReady()
+    const now = performance.now(), dt = Math.min(50, now - lastFrame)
+    lastFrame = now
+    update(now, dt)
+    const ox = R(cam.x - W / 2), oy = R(cam.y - H / 2)
+    drawWorld(now, ox, oy)
+    drawViewmodel(now)
+    camPrev = { x: cam.x, y: cam.y }
+    if (state === 'play' || state === 'dying') {
+      drawDamage(now)
+      PK.crosshair(W / 2, H / 2, R(spread) + (now - lastShot < 80 ? 1 : 0))
+      drawHud(now)
+      drawPrompt(now)
+    } else if (state === 'ready') drawReady()
     else drawOver(now)
-    if (state !== 'play') muteRect = PK.muteButton(S.W, S.H)
-    exitRect = PK.exitButton(S.H)
-    PK.crosshair(P.x, P.y, now < kickUntil ? 2 : 0)
+    if (state === 'ready' || state === 'over') muteRect = PK.muteButton(W, H)
+    exitRect = PK.exitButton(H, { x: 3, y: state === 'play' || state === 'dying' ? 36 : H - 16 })
+    if (!P.locked && state !== 'play' && state !== 'dying') PK.crosshair(P.x, P.y)   // 菜单里用普通光标点按钮
     S.present()
     requestAnimationFrame(frame)
   }
 
-  if (SLOW) window.__hold = () => ({ state, phase, ri, rd, cross: { x: P.x, y: P.y }, score, door, crate, ground })
+  if (SLOW) window.__hold = () => ({ state, phase, rd, cam: { ...cam }, kills, hp, clip, spread, markerOf, angleGeo, enemyFx, tParts, W, H })
   addEventListener('resize', layout)
   layout()
   P.center()

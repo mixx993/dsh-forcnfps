@@ -217,8 +217,8 @@ window.PK = (() => {
   })()
 
   // 左下角「‹ 退出」按钮，返回点击区域；点了调用 goHome()
-  function exitButton(H) {
-    const x = 3, y = H - 16, w = 40, h = 14
+  function exitButton(H, at) {
+    const x = at ? at.x : 3, y = at ? at.y : H - 16, w = 40, h = 14
     g.fillStyle = C.dusk; g.fillRect(x + 1, y, w - 2, h); g.fillRect(x, y + 1, w, h - 2)
     g.fillStyle = C.ink; g.fillRect(x + 1, y + 1, w - 2, h - 2)
     btext('<', x + 4, y + 5, C.fog)
@@ -270,8 +270,9 @@ window.PK = (() => {
     raw: () => store.get(RAW_KEY),     // '1' 原始输入已开启，'0' 只能普通锁定，'x' 锁定被拒绝，null 还没检测过
   }
 
-  // 准星位置：灵敏度开关打开时，点一下锁定鼠标，按游戏公式把原始位移换算成准星移动；没开或没锁定时就跟着系统光标走
-  function pointer(S) {
+  // 准星位置：灵敏度开关打开时，点一下锁定鼠标，按游戏公式把原始位移换算成准星移动；没开或没锁定时就跟着系统光标走。
+  // opts.onDelta(dx, dy)：锁定时改为把换算后的位移（美术像素）交给游戏自己处理，用于「准星固定、视角转动」的第一人称玩法
+  function pointer(S, opts = {}) {
     const P = { x: 0, y: 0, locked: false }
     let handler = null
     S.cv.addEventListener('pointermove', e => { if (!P.locked) Object.assign(P, S.toBuf(e)) })
@@ -279,6 +280,7 @@ window.PK = (() => {
       if (!P.locked) return
       const v = sens.get(), gm = SENS_GAMES[v.game]
       const k = v.value * gm.yaw * (S.W / gm.fov)       // 每个计数走多少美术像素 = 度/计数 × 像素/度（画布宽度对应水平视野）
+      if (opts.onDelta) { opts.onDelta(e.movementX * k, e.movementY * k); return }
       P.x = Math.max(0, Math.min(S.W - 1, P.x + e.movementX * k))
       P.y = Math.max(0, Math.min(S.H - 1, P.y + e.movementY * k))
     })
