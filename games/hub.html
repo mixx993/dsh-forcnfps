@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ForCNFps</title>
+<!-- ForCNFps 选单：三张像素卡片，点一张就通知外层（DSH 插件）切到那个游戏，单独打开时直接跳到对应页面；
+     下面一条是灵敏度设置（鼠标 DPI + CS2/瓦罗兰特灵敏度，换算 eDPI、cm/360 和另一款游戏的等效值）。底层工具在 pixelkit.js。 -->
+<style>
+  * { margin:0; padding:0; }
+  html, body { height:100%; background:#1a1c2c; overflow:hidden; user-select:none; -webkit-user-select:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; touch-action:none; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script src="pixelkit.js"></script>
+<script>
+(() => {
+  const { C, RM, B4, json, btext, ctext, icon, ring, panel, inRect, audio } = PK
+  const S = PK.screen(document.getElementById('cv'))
+  const g = S.g
+  let stars = [], cards = [], hover = null, muteRect = null
+
+  const GAMES = [
+    { id: 'schulte', title: '舒尔特斩', sub: 'SCHULTE', thumb: thumbSchulte },
+    { id: 'aim', title: '瞄准训练', sub: 'AIM TRAINER', thumb: thumbAim, best: () => json('aim-dots-best-v1') },
+    { id: 'hold', title: '架枪训练', sub: 'HOLD ANGLE', thumb: thumbHold, best: () => json('hold-angle-best-v1') },
+  ]
+
+  // ---------- 24×24 缩略图 ----------
+  function thumbSchulte(x, y) {
+    g.fillStyle = C.ink; g.fillRect(x, y, 24, 24)
+    ;[7, 2, 9, 4, 1, 6, 3, 8, 5].forEach((n, i) => {
+      const cx = x + 1 + (i % 3) * 8, cy = y + 1 + Math.floor(i / 3) * 8
+      g.fillStyle = C.navy; g.fillRect(cx, cy, 6, 6)
+      btext(n, cx + 2, cy + 1, n <= 3 ? C.slate : C.white)
+    })
+    for (let i = 0; i < 20; i++) {          // 一道刀光
+      g.fillStyle = C.red; g.fillRect(x + 2 + i, y + 21 - i, 2, 1)
+      g.fillStyle = C.gold; g.fillRect(x + 3 + i, y + 21 - i, 1, 1)
+    }
+  }
+  function thumbAim(x, y, now, active) {
+    g.fillStyle = C.ink; g.fillRect(x, y, 24, 24)
+    const r = 8, cx = x + 12, cy = y + 12 + (active && !RM ? Math.floor(now / 450) % 2 : 0)
+    const ramp = [C.plum, C.red, C.orange, C.gold]
+    for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++) {
+      const d = Math.hypot(i, j)
+      if (d > r + 0.25) continue
+      let col
+      if (d > r - 0.75) col = C.plum
+      else if (Math.hypot(i / r + 0.36, j / r + 0.4) < 0.25) col = C.white
+      else {
+        const nx = i / r, ny = j / r, nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny))
+        const l = Math.max(0, -0.45 * nx - 0.55 * ny + 0.7 * nz)
+        col = ramp[Math.max(0, Math.min(3, Math.floor(0.55 + l * 2.9 + (B4[(j + 32) & 3][(i + 32) & 3] / 16 - 0.5) * 0.85)))]
+      }
+      g.fillStyle = col; g.fillRect(cx + i, cy + j, 1, 1)
+    }
+  }
+  function thumbHold(x, y, now, active) {
+    g.fillStyle = C.gold; g.fillRect(x, y, 24, 24)
+    g.fillStyle = C.orange
+    for (let yy = 3; yy < 24; yy += 5) g.fillRect(x, y + yy, 24, 1)
+    for (let yy = 0; yy < 24; yy += 5) for (let xx = (yy / 5) % 2 ? 0 : 5; xx < 24; xx += 10) g.fillRect(x + xx, y + yy, 1, 4)
+    g.fillStyle = C.red; g.fillRect(x + 3, y + 6, 12, 18)
+    g.fillStyle = C.ink; g.fillRect(x + 4, y + 7, 10, 17)
+    // 探出半个脑袋
+    const peek = active && !RM && Math.floor(now / 600) % 3 === 0 ? 1 : 3
+    g.fillStyle = C.red; g.fillRect(x + 14 - peek, y + 12, peek, 1)
+    g.fillStyle = C.orange; g.fillRect(x + 14 - peek, y + 13, peek, 3)
+    g.fillStyle = C.green; g.fillRect(x + 14 - peek, y + 16, peek, 5)
+    // 准星
+    const cx = x + 12, cy = y + 14
+    g.fillStyle = C.ink
+    for (const [ax, ay, w, h] of [[cx - 5, cy, 3, 1], [cx + 3, cy, 3, 1], [cx, cy - 5, 1, 3], [cx, cy + 3, 1, 3]]) g.fillRect(ax - 1, ay - 1, w + 2, h + 2)
+    g.fillStyle = C.lime
+    for (const [ax, ay, w, h] of [[cx - 5, cy, 3, 1], [cx + 3, cy, 3, 1], [cx, cy - 5, 1, 3], [cx, cy + 3, 1, 3]]) g.fillRect(ax, ay, w, h)
+  }
+
+  // ---------- 布局与绘制 ----------
+  function resize() { S.resize(); stars = PK.starfield(S.W, S.H, 99) }
+
+  // 灵敏度设置页的草稿：输入框里是文字，失焦或回车时才校验写回
+  let view = 'menu', focus = null, fresh = false, draft = null, ui = {}
+  const SENS = PK.sens
+  function openSens() {
+    const v = SENS.get()
+    draft = { ...v, dpiText: String(v.dpi), valText: String(v.value) }
+    view = 'sens'; focus = null
+  }
+  const parsedDpi = () => { const d = parseInt(draft.dpiText, 10); return d >= 100 && d <= 32000 ? d : null }
+  const parsedVal = () => { const s = parseFloat(draft.valText); return s > 0 && s <= 50 ? Math.round(s * 1000) / 1000 : null }
+  function commit() {
+    draft.dpi = parsedDpi() || draft.dpi; draft.dpiText = String(draft.dpi)
+    draft.value = parsedVal() || draft.value; draft.valText = String(draft.value)
+    SENS.set(draft)
+  }
+  const live = () => ({ game: draft.game, dpi: parsedDpi() || draft.dpi, value: parsedVal() || draft.value })
+
+  function drawMenu(now, cx) {
+    const cw = Math.min(S.W - 12, 124), ch = 34, gap = 6
+    const total = 50 + GAMES.length * (ch + gap) + 24
+    let y = Math.max(4, Math.floor((S.H - total) / 2) - 6)
+    ctext('ForCNFps', cx, y, C.gold, { align: 'center', size: 16, bold: true, shadow: C.red })
+    btext('FPS TRAINING ARCADE', cx, y + 22, C.slate, 1, 'center')
+    ctext('等任务的时候来一局', cx, y + 30, C.fog, { align: 'center' })
+    y += 52
+
+    const x = Math.floor((S.W - cw) / 2)
+    cards = GAMES.map((game, i) => {
+      const r = { x, y: y + i * (ch + gap), w: cw, h: ch, id: game.id }
+      const on = hover === game.id
+      panel(r.x, r.y, r.w, r.h, on ? C.gold : C.dusk)
+      game.thumb(r.x + 5, r.y + 5, now, on)
+      g.fillStyle = C.dusk
+      g.fillRect(r.x + 4, r.y + 4, 26, 1); g.fillRect(r.x + 4, r.y + 29, 26, 1); g.fillRect(r.x + 4, r.y + 5, 1, 24); g.fillRect(r.x + 29, r.y + 5, 1, 24)
+      ctext(game.title, r.x + 35, r.y + 4, on ? C.gold : C.white)
+      btext(game.sub, r.x + 35, r.y + 22, C.slate)
+      const best = game.best && game.best()
+      if (best) {
+        btext(best.score, r.x + r.w - 6, r.y + 22, C.gold, 1, 'right')
+        icon('star', r.x + r.w - 15 - PK.btextW(best.score), r.y + 21, C.gold)
+      }
+      btext('>', r.x + r.w - 8, r.y + 9, on ? C.gold : C.slate)
+      return r
+    })
+
+    // 灵敏度入口
+    const v = SENS.get(), r = { x, y: y + GAMES.length * (ch + gap), w: cw, h: 20, id: 'sens' }
+    const on = hover === 'sens'
+    panel(r.x, r.y, r.w, r.h, on ? C.gold : C.dusk)
+    icon('mouse', r.x + 6, r.y + 6, v.on ? C.lime : C.slate)
+    ctext('灵敏度', r.x + 16, r.y + 3, on ? C.gold : C.white)
+    btext(v.on ? `${SENS.games[v.game].short} ${v.value} · ${v.dpi}` : 'OFF', r.x + r.w - 13, r.y + 8, v.on ? C.fog : C.slate, 1, 'right')
+    btext('>', r.x + r.w - 8, r.y + 8, on ? C.gold : C.slate)
+    cards.push(r)
+  }
+
+  // 画布上的输入框：数字用点阵字，聚焦时金色边框 + 闪烁光标；刚聚焦时整段高亮，第一下按键直接替换
+  function field(id, label, y, x, w) {
+    const bw = 56, bx = x + w - bw, text = id === 'dpi' ? draft.dpiText : draft.valText
+    const focused = focus === id
+    ui[id] = { x: bx, y, w: bw, h: 15 }
+    ctext(label, x, y + 1, C.fog)
+    g.fillStyle = focused ? C.gold : C.dusk; g.fillRect(bx, y, bw, 15)
+    g.fillStyle = C.ink; g.fillRect(bx + 1, y + 1, bw - 2, 13)
+    const tw = PK.btextW(text, 2)
+    if (focused && fresh && text) { g.fillStyle = C.navy; g.fillRect(bx + bw - 4 - tw - 1, y + 2, tw + 2, 11) }
+    btext(text, bx + bw - 4, y + 3, focused ? C.white : C.fog, 2, 'right')
+    if (focused && !fresh && Math.floor(performance.now() / 500) % 2 === 0) { g.fillStyle = C.gold; g.fillRect(bx + bw - 3, y + 2, 1, 11) }
+  }
+
+  function drawSens(now, cx) {
+    ui = {}
+    const pw = Math.min(S.W - 12, 124), px = Math.floor((S.W - pw) / 2)
+    let y = Math.max(4, Math.floor((S.H - 236) / 2))
+    ctext('灵敏度', cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
+    btext('MOUSE SENSITIVITY', cx, y + 21, C.slate, 1, 'center')
+    y += 32
+
+    // 游戏选择
+    const tw = Math.floor((pw - 4) / 2)
+    ;['cs', 'val'].forEach((id, i) => {
+      const r = { x: px + i * (tw + 4), y, w: tw, h: 16 }, on = draft.game === id
+      ui['tab_' + id] = r
+      g.fillStyle = on ? C.orange : C.dusk; g.fillRect(r.x, r.y, r.w, r.h)
+      if (on) { g.fillStyle = C.gold; g.fillRect(r.x, r.y, r.w, 1) }
+      if (id === 'cs') btext(SENS.games.cs.name, r.x + Math.floor(r.w / 2), r.y + 6, on ? C.ink : C.fog, 1, 'center')
+      else ctext(SENS.games.val.name, r.x + Math.floor(r.w / 2), r.y + 1, on ? C.ink : C.fog, { align: 'center' })
+    })
+    y += 23
+
+    field('dpi', '鼠标 DPI', y, px, pw); y += 20
+    field('val', '游戏灵敏度', y, px, pw); y += 22
+
+    // 换算结果
+    const v = live(), other = v.game === 'cs' ? 'val' : 'cs'
+    g.fillStyle = C.dusk; g.fillRect(px, y, pw, 40)
+    btext('EDPI', px + 5, y + 5, C.fog); btext(SENS.edpi(v), px + pw - 5, y + 5, C.white, 1, 'right')
+    btext('CM/360', px + 5, y + 14, C.fog); btext(SENS.cm360(v).toFixed(1), px + pw - 5, y + 14, C.white, 1, 'right')
+    if (other === 'val') ctext('= 瓦罗兰特', px + 4, y + 22, C.fog)
+    else { btext('= CS2/CSGO', px + 5, y + 26, C.fog) }
+    btext(SENS.convert(v, other).toFixed(3), px + pw - 5, y + 26, C.gold, 1, 'right')
+    y += 46
+
+    // 开关：是否在游戏里按这个灵敏度移动准星
+    ctext('按游戏手感瞄准', px, y + 1, C.fog)
+    const sw = { x: px + pw - 24, y: y + 2, w: 24, h: 11 }
+    ui.toggle = sw
+    g.fillStyle = draft.on ? C.green : C.dusk; g.fillRect(sw.x + 1, sw.y, sw.w - 2, sw.h); g.fillRect(sw.x, sw.y + 1, sw.w, sw.h - 2)
+    g.fillStyle = draft.on ? C.white : C.slate; g.fillRect(draft.on ? sw.x + sw.w - 10 : sw.x + 2, sw.y + 2, 8, sw.h - 4)
+    y += 17
+
+    const raw = SENS.raw()
+    const RAW = { '1': ['原始输入：已开启', C.green], '0': ['原始输入：不可用', C.orange], x: ['鼠标锁定被拒绝', C.red] }
+    const [rawText, rawCol] = RAW[raw] || ['原始输入：未检测', C.slate]
+    ctext(rawText, px, y, rawCol)
+    y += 15
+    ctext('游戏里点一下锁定鼠标', px, y, C.slate)
+    y += 14
+    ctext('按 ESC 解锁', px, y, C.slate)
+    y += 18
+    ui.done = PK.button(px, y, pw, '完成')
+  }
+
+  function frame() {
+    const now = performance.now(), cx = Math.floor(S.W / 2)
+    g.fillStyle = C.ink; g.fillRect(0, 0, S.W, S.H)
+    PK.drawStars(stars, now)
+    if (view === 'menu') drawMenu(now, cx)
+    else drawSens(now, cx)
+    muteRect = PK.muteButton(S.W, S.H)
+    S.present()
+    requestAnimationFrame(frame)
+  }
+
+  // ---------- 输入 ----------
+  const cardAt = p => cards.find(r => inRect(p.x, p.y, r))
+  S.cv.addEventListener('pointermove', e => {
+    const p = S.toBuf(e)
+    if (view === 'menu') {
+      const r = cardAt(p)
+      hover = r ? r.id : null
+      S.cv.style.cursor = r ? 'pointer' : 'default'
+    } else {
+      const over = Object.entries(ui).find(([, r]) => inRect(p.x, p.y, r))
+      S.cv.style.cursor = !over ? 'default' : over[0] === 'dpi' || over[0] === 'val' ? 'text' : 'pointer'
+    }
+  })
+  S.cv.addEventListener('pointerleave', () => { hover = null })
+  S.cv.addEventListener('pointerdown', e => {
+    e.preventDefault()
+    window.focus()
+    audio.unlock()
+    const p = S.toBuf(e)
+    if (inRect(p.x, p.y, muteRect)) { audio.toggle(); return }
+
+    if (view === 'sens') {
+      const hit = Object.keys(ui).find(k => inRect(p.x, p.y, ui[k]))
+      if (hit === 'dpi' || hit === 'val') { if (focus && hit !== focus) commit(); focusField(hit); return }
+      blurField()
+      if (hit === 'tab_cs' || hit === 'tab_val') { draft.game = hit.slice(4); draft.on = true; commit(); audio.note(7, 0.04) }
+      else if (hit === 'toggle') { draft.on = !draft.on; commit(); audio.note(draft.on ? 12 : 0, 0.05) }
+      else if (hit === 'done') { commit(); view = 'menu'; audio.note(7, 0.05) }
+      return
+    }
+
+    const r = cardAt(p)
+    if (!r) return
+    if (r.id === 'sens') { openSens(); audio.note(7, 0.04); return }
+    audio.arp([0, 7, 12], 0.04)
+    if (window.parent !== window) window.parent.postMessage({ type: 'dsh-arcade:open', game: r.id }, '*')
+    else if (r.id !== 'schulte') location.href = r.id + '.html'   // 单独预览时直接跳过去
+  })
+
+  // 输入框背后是一个看不见的真输入框：键盘、粘贴、输入法都走它，画布只负责显示
+  const input = document.createElement('input')
+  Object.assign(input.style, { position: 'fixed', left: '-1000px', top: '0', opacity: '0' })
+  input.setAttribute('inputmode', 'decimal')
+  input.autocomplete = 'off'
+  document.body.appendChild(input)
+  function focusField(id) { focus = id; fresh = true; input.value = ''; input.focus() }
+  function blurField() { if (focus) commit(); focus = null; input.blur() }
+  input.addEventListener('input', () => {
+    if (!focus) return
+    let t = input.value.replace(focus === 'dpi' ? /[^0-9]/g : /[^0-9.]/g, '')
+    const dot = t.indexOf('.')
+    if (dot >= 0) t = t.slice(0, dot + 1) + t.slice(dot + 1).replace(/\./g, '')
+    t = t.slice(0, focus === 'dpi' ? 5 : 6)
+    input.value = t
+    draft[focus === 'dpi' ? 'dpiText' : 'valText'] = t
+    fresh = false
+    draft.on = true
+  })
+  // 回车确认，Tab 跳到另一个，Esc 放弃这次修改；刚聚焦时按退格清空
+  input.addEventListener('keydown', e => {
+    if (!focus) return
+    if (e.key === 'Backspace' && fresh) { draft[focus === 'dpi' ? 'dpiText' : 'valText'] = ''; fresh = false }
+    else if (e.key === 'Enter') { e.preventDefault(); blurField() }
+    else if (e.key === 'Tab') { e.preventDefault(); commit(); focusField(focus === 'dpi' ? 'val' : 'dpi') }
+    else if (e.key === 'Escape') { draft.dpiText = String(draft.dpi); draft.valText = String(draft.value); focus = null; input.blur() }
+  })
+  input.addEventListener('blur', () => { if (focus) { commit(); focus = null } })
+
+  addEventListener('resize', resize)
+  resize()
+  requestAnimationFrame(frame)
+})()
+</script>
+</body>
+</html>

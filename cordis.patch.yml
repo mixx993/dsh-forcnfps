@@ -1,0 +1,5 @@
+# 插件只需要一行配置。name 必须是裸包名：
+# 服务端按它加载 index.js，网页端按它找到 client.js。
+- insert:
+    - id: dsh-forcnfps
+      name: dsh-forcnfps

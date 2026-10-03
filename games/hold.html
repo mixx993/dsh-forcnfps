@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>架枪训练</title>
+<!-- CS 风格架枪：准星先架到点位上稳住，随机等待后敌人从门左/门右/箱子后探头，第一时间开枪。
+     一局 10 回合，练稳定性（等待时准星的抖动）和反应（探头到开枪的毫秒数）。场景仿 Dust2，像素风，底层工具在 pixelkit.js。 -->
+<style>
+  * { margin:0; padding:0; }
+  html, body { height:100%; background:#1a1c2c; overflow:hidden; user-select:none; -webkit-user-select:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; cursor:none; touch-action:none; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script src="pixelkit.js"></script>
+<script>
+(() => {
+  const { C, RM, B4, store, json, btext, ctext, icon, ring, panel, button, inRect, audio } = PK
+  const ROUNDS = 10
+  const KEY_BEST = 'hold-angle-best-v1'
+  const SLIDE = 90, RETREAT = 90                     // 探出 / 缩回用时（毫秒）
+  const SLOW = /[?&]slow/.test(location.search)       // 调试：地址带 ?slow 时敌人停留 10 倍时长
+  const exposure = r => (700 - r * 25) * (SLOW ? 10 : 1)   // 第 r 回合（0 起）敌人完全露出的时长，越往后越短
+  const ZONE = 4                                      // 架点判定半径（美术像素）
+  const RANKS = [
+    [2300, '全球精英', 'GLOBAL ELITE'], [1900, '传奇之鹰', 'LEGENDARY EAGLE'],
+    [1500, '守护精英', 'MASTER GUARDIAN'], [1000, '黄金新星', 'GOLD NOVA'], [0, '白银', 'SILVER'],
+  ]
+  const rankOf = score => RANKS.find(r => score >= r[0])
+
+  const S = PK.screen(document.getElementById('cv'))
+  const g = S.g
+  const P = PK.pointer(S)        // 准星位置；开了灵敏度换算时会锁定鼠标
+  const rand = (a, b) => a + Math.random() * (b - a)
+
+  // ---------- 敌人精灵（9×22，面朝右；r 头巾 s 皮肤 k 深色 g/d 衣服 n 裤子 w 枪） ----------
+  const ENEMY = [
+    '...rrr...', '..rrrrr..', '..ksssk..', '..sksks..', '..sssss..', '...sss...',
+    '.ggggggg.', 'gggggggww', 'ggdgggwww', 'ggdggg.w.', 'ggdggg...', '.gdggg...', '.ggggg...',
+    '.nnnnn...', '.nn.nn...', '.nn.nn...', '.nn.nn...', '.nn.nn...', '.nn.nn...', '.nn.nn...',
+    '.kk.kk...', 'kkk.kkk..',
+  ]
+  const EW = 9, EH = 22
+  const PAL = { r: C.red, s: C.orange, k: C.ink, g: C.green, d: C.teal, n: C.navy, w: C.slate }
+  function sprite(flip, tint) {
+    const c = document.createElement('canvas')
+    c.width = EW; c.height = EH
+    const x2 = c.getContext('2d')
+    ENEMY.forEach((row, y) => {
+      for (let x = 0; x < EW; x++) {
+        const ch = row[x]
+        if (ch === '.') continue
+        x2.fillStyle = tint || PAL[ch]
+        x2.fillRect(flip ? EW - 1 - x : x, y, 1, 1)
+      }
+    })
+    return c
+  }
+  const SPR = { right: sprite(false), left: sprite(true), flashR: sprite(false, C.white), flashL: sprite(true, C.white), deadR: sprite(false, C.red), deadL: sprite(true, C.red) }
+
+  // ---------- 场景：三层预渲染，敌人夹在层与层之间，被墙和箱子自然挡住 ----------
+  // bg：天空 + 门洞里的暗处；wall：带门洞的砖墙和地面；crate：木箱
+  let scene, ground, wallTop, door, crate, HY
+  const layers = {}
+  function layout() {
+    S.resize()
+    const sw = S.W - 8
+    const sh = Math.max(100, Math.min(S.H - 64, Math.round(sw * 1.05)))
+    HY = Math.max(2, Math.floor((S.H - sh - 50) / 2))
+    scene = { x: 4, y: HY + 22, w: sw, h: sh }
+    wallTop = scene.y + Math.round(sh * 0.2)
+    ground = scene.y + Math.round(sh * 0.84)
+    const dw = Math.round(sw * 0.32), dh = Math.round(sh * 0.5)
+    door = { x: scene.x + Math.round(sw * 0.14), y: ground - dh, w: dw, h: dh }
+    const cw = Math.round(sw * 0.27), ch = Math.round(sh * 0.19)
+    crate = { x: scene.x + sw - cw - Math.round(sw * 0.08), y: ground - ch, w: cw, h: ch }
+    bake()
+  }
+
+  function layer(draw) {
+    const c = document.createElement('canvas')
+    c.width = S.W; c.height = S.H
+    const x2 = c.getContext('2d')
+    const px = (x, y, col) => { x2.fillStyle = col; x2.fillRect(x, y, 1, 1) }
+    draw(x2, px)
+    return c
+  }
+  // 门洞是否包含某像素（顶部切角成拱形）
+  function inDoor(x, y) {
+    if (x < door.x || x >= door.x + door.w || y < door.y || y >= ground) return false
+    const row = y - door.y, cut = [3, 2, 1][row] || 0
+    return x >= door.x + cut && x < door.x + door.w - cut
+  }
+
+  function bake() {
+    const { x: sx, y: sy, w: sw, h: sh } = scene
+    let seed = 7
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+
+    layers.bg = layer((x2, px) => {
+      // 天空：底部几行抖动成浅青色的雾
+      for (let y = sy; y < wallTop; y++) for (let x = sx; x < sx + sw; x++) {
+        const k = (y - (wallTop - 5)) / 5
+        px(x, y, k > 0 && B4[y & 3][x & 3] / 16 < k ? C.cyan : C.sky)
+      }
+      // 一朵像素云
+      const cx = sx + Math.round(sw * 0.62), cy = sy + Math.round((wallTop - sy) * 0.35)
+      x2.fillStyle = C.white
+      x2.fillRect(cx, cy, 14, 2); x2.fillRect(cx + 3, cy - 2, 7, 2); x2.fillRect(cx - 3, cy + 2, 20, 1)
+      x2.fillStyle = C.cyan; x2.fillRect(cx - 2, cy + 3, 18, 1)
+      // 门洞里：深处偏暗，顶上漏一点光
+      for (let y = door.y; y < ground; y++) for (let x = door.x; x < door.x + door.w; x++) {
+        const k = 1 - (y - door.y) / 12
+        px(x, y, k > 0 && B4[y & 3][x & 3] / 16 < k ? C.navy : y >= ground - 3 ? C.dusk : C.ink)
+      }
+    })
+
+    layers.wall = layer((x2, px) => {
+      for (let y = wallTop; y < ground; y++) for (let x = sx; x < sx + sw; x++) {
+        if (inDoor(x, y)) continue
+        const row = Math.floor((y - wallTop - 2) / 6)
+        let col = C.gold
+        if (y === wallTop) col = C.orange
+        else if (y === wallTop + 1) col = C.red
+        else if ((y - wallTop - 2) % 6 === 5) col = C.orange                                 // 砖缝（横）
+        else if ((x - sx + (row & 1) * 6) % 12 === 0) col = C.orange                         // 砖缝（竖，错缝）
+        else if (ground - y <= 6 && B4[y & 3][x & 3] / 16 < (7 - (ground - y)) / 8) col = C.orange   // 墙根渐暗
+        else { const r = rnd(); if (r < 0.04) col = C.orange; else if (r < 0.05) col = C.white }      // 风化斑点
+        px(x, y, col)
+      }
+      // 门框（木头）
+      x2.fillStyle = C.red
+      x2.fillRect(door.x - 2, door.y + 3, 2, ground - door.y - 3)
+      x2.fillRect(door.x + door.w, door.y + 3, 2, ground - door.y - 3)
+      x2.fillRect(door.x + 3, door.y - 2, door.w - 6, 2)
+      x2.fillStyle = C.plum
+      x2.fillRect(door.x - 1, door.y + 3, 1, ground - door.y - 3)
+      x2.fillRect(door.x + door.w + 1, door.y + 3, 1, ground - door.y - 3)
+      // 地面
+      for (let y = ground; y < sy + sh; y++) for (let x = sx; x < sx + sw; x++) {
+        const k = (y - ground) / (sy + sh - ground)
+        px(x, y, y === ground ? C.red : B4[y & 3][x & 3] / 16 < k * 0.7 ? C.red : C.orange)
+      }
+    })
+
+    layers.crate = layer((x2, px) => {
+      const { x, y, w, h } = crate
+      for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) if ((i + j) % 2 === 0) px(x + w + i, ground - 1 + j, C.red)   // 地上的影子
+      x2.fillStyle = C.red; x2.fillRect(x, y, w, h)
+      x2.fillStyle = C.orange; x2.fillRect(x + 1, y + 1, w - 2, h - 2)
+      x2.fillStyle = C.gold; x2.fillRect(x + 1, y + 1, w - 2, 1)
+      x2.fillStyle = C.red
+      for (let yy = y + 5; yy < y + h - 2; yy += 5) x2.fillRect(x + 1, yy, w - 2, 1)                     // 木板缝
+      x2.fillRect(x + 3, y + 1, 2, h - 2); x2.fillRect(x + w - 5, y + 1, 2, h - 2)                       // 竖档
+      for (let i = 0; i < w - 10; i++) {                                                                // 斜撑
+        px(x + 5 + i, y + 2 + Math.round(i * (h - 4) / (w - 10)), C.plum)
+        px(x + 5 + i, y + 3 + Math.round(i * (h - 4) / (w - 10)), C.red)
+      }
+    })
+  }
+
+  // ---------- 架点 ----------
+  // L：门洞左沿；R：门洞右沿；C：箱子上沿。marker 是该架的头部位置
+  const angleInfo = a => {
+    const headY = ground - EH + 3
+    if (a === 'L') return { marker: { x: door.x + 5, y: headY } }
+    if (a === 'R') return { marker: { x: door.x + door.w - 6, y: headY } }
+    return { marker: { x: crate.x + Math.round(crate.w * 0.3) + 4, y: crate.y - 7 } }
+  }
+  // 当前探头程度 p∈[0,1] 时精灵左上角位置和朝向
+  function enemyPos(rd, p) {
+    if (rd.angle === 'L') return { x: Math.round(door.x - EW + (EW + rd.peek) * p), y: ground - EH, face: 'right' }
+    if (rd.angle === 'R') return { x: Math.round(door.x + door.w - (EW + rd.peek) * p), y: ground - EH, face: 'left' }
+    const ex = crate.x + Math.round(crate.w * 0.3) + rd.shift
+    return { x: ex, y: Math.round(crate.y + 1 - (11 + rd.peek) * p), face: rd.shift > 0 ? 'left' : 'right' }
+  }
+  // 敌人可见区域：门洞内，或箱子上沿以上
+  const visible = (rd, x, y) => rd.angle === 'C' ? y < crate.y : inDoor(Math.floor(x), Math.floor(y))
+  function hitTest(rd, pos, x, y) {
+    if (!visible(rd, x, y)) return null
+    const lx = x - pos.x, ly = y - pos.y
+    const head = { x: 1.5, y: -0.5, w: 6, h: 7 }                          // 头：第 2–6 列、0–5 行，外扩半像素
+    const body = pos.face === 'right' ? { x: 0, y: 6, w: 8, h: 16 } : { x: 1, y: 6, w: 8, h: 16 }
+    if (inRect(lx, ly, head)) return 'head'
+    if (inRect(lx, ly, body)) return 'body'
+    return null
+  }
+
+  // ---------- 状态 ----------
+  let state = 'ready'           // ready | play | over
+  let phase = 'place'           // place | hold | peek | after
+  let ri = 0, rd = null, rounds = [], score = 0
+  let kickUntil = 0, insideSince = 0
+  let fx = [], result = null, btnRect = null, muteRect = null, exitRect = null, lastAngle = []
+
+  function newRound() {
+    const pool = ['L', 'R', 'C'].filter(a => !(lastAngle[0] === a && lastAngle[1] === a))   // 同一架点不连着来三次
+    const angle = pool[Math.floor(Math.random() * pool.length)]
+    lastAngle = [angle, lastAngle[0]]
+    rd = {
+      angle,
+      peek: Math.round(angle === 'C' ? rand(0, 3) : rand(3, 10)),   // 探出多少像素：每回合位置略有不同，要微调
+      shift: Math.round(rand(-4, 4)),
+      delay: rand(900, 3500),
+      samples: [], result: null, rt: 0, stab: 0, pts: 0,
+    }
+    phase = 'place'
+    insideSince = 0
+  }
+
+  function start() {
+    state = 'play'
+    ri = 0; score = 0; rounds = []; fx = []; lastAngle = []
+    newRound()
+  }
+
+  function finishRound(res, now, hitPos) {
+    rd.result = res
+    if (rd.samples.length > 2) {
+      const n = rd.samples.length
+      const mx = rd.samples.reduce((a, p) => a + p.x, 0) / n, my = rd.samples.reduce((a, p) => a + p.y, 0) / n
+      const jitter = Math.sqrt(rd.samples.reduce((a, p) => a + (p.x - mx) ** 2 + (p.y - my) ** 2, 0) / n)
+      const m = angleInfo(rd.angle).marker, last = rd.samples[n - 1]
+      const drift = Math.hypot(last.x - m.x, last.y - m.y)
+      rd.stab = Math.round(Math.max(0, Math.min(100, 100 - jitter * 30 - Math.max(0, drift - 3) * 8)))
+    }
+    if (res === 'head' || res === 'body') {
+      rd.pts = (res === 'head' ? 150 : 100) + Math.round(Math.max(0, Math.min(1, (700 - rd.rt) / 500)) * 100) + Math.round(rd.stab / 2)
+      rd.deadAt = now; rd.deadPos = hitPos
+    }
+    score += rd.pts
+    rounds.push(rd)
+    phase = 'after'
+    rd.afterAt = now
+  }
+
+  function end() {
+    state = 'over'
+    const hits = rounds.filter(r => r.result === 'head' || r.result === 'body')
+    const heads = rounds.filter(r => r.result === 'head').length
+    const held = rounds.filter(r => r.samples.length > 2)
+    const best = json(KEY_BEST)
+    const isRec = score > 0 && (!best || score > best.score)
+    const rank = rankOf(score)
+    if (isRec) store.set(KEY_BEST, JSON.stringify({ score, rank: rank[1] }))
+    P.unlock()
+    result = {
+      score, rank, isRec, best, at: performance.now(),
+      hits: hits.length,
+      rt: hits.length ? Math.round(hits.reduce((a, r) => a + r.rt, 0) / hits.length) : 0,
+      hs: hits.length ? Math.round(heads / hits.length * 100) : 0,
+      stab: held.length ? Math.round(held.reduce((a, r) => a + r.stab, 0) / held.length) : 0,
+    }
+    audio.arp([0, 4, 7, 12, 7, 12], 0.07)
+    if (isRec) audio.arp([16, 19, 24], 0.08)
+  }
+
+  // ---------- 输入 ----------
+  P.onDown(({ x, y }) => {
+    audio.unlock()
+    const now = performance.now()
+
+    if (inRect(x, y, exitRect)) { audio.note(0, 0.05); PK.goHome(); return }
+    if (state !== 'play' && inRect(x, y, muteRect)) { audio.toggle(); return }
+    if (state === 'ready' || state === 'over') {
+      if (inRect(x, y, btnRect) && (state === 'ready' || now - result.at > 400)) { P.lock(); audio.arp([0, 4, 7, 12], 0.045); start() }
+      return
+    }
+    if (P.wantsLock()) { P.lock(); return }   // 中途按 ESC 解锁了：这一下只用来重新锁定，不算开枪
+    if (phase === 'place' || phase === 'after') return
+
+    // 开枪
+    kickUntil = now + 80
+    audio.noise(0.07, 0.09)
+    audio.note(-24, 0.07, 'square', 0.05)
+    if (phase === 'hold') { finishRound('early', now); return }
+    const t = now - rd.peekAt
+    const pos = enemyPos(rd, peekP(t))
+    const hit = hitTest(rd, pos, x, y)
+    rd.rt = Math.round(t)
+    if (hit) {
+      finishRound(hit, now, pos)
+      burst(x, y)
+      if (hit === 'head') { audio.note(24, 0.06, 'square', 0.05, 0.02); audio.note(31, 0.12, 'triangle', 0.06, 0.05) }   // 爆头「叮」
+      else audio.note(-12, 0.08, 'triangle', 0.09, 0.02)
+    } else {
+      finishRound('miss', now)
+      fx.push({ k: 'miss', x: Math.round(x), y: Math.round(y), t: now })
+      audio.noise(0.05, 0.03, 0.04)
+    }
+  })
+
+  // 探头进度：分 3 步探出（像素风的逐帧感），停留，再缩回
+  function peekP(t) {
+    const W = exposure(ri)
+    if (t < SLIDE) return Math.ceil((t / SLIDE) * 3) / 3
+    if (t < SLIDE + W) return 1
+    if (t < SLIDE + W + RETREAT) return 1 - Math.ceil(((t - SLIDE - W) / RETREAT) * 3) / 3
+    return 0
+  }
+
+  function burst(x, y) {
+    if (RM) return
+    const now = performance.now()
+    for (let i = 0; i < 8; i++) fx.push({ k: 'blood', x, y, vx: rand(-40, 40), vy: rand(-50, 10), t: now })
+  }
+
+  // ---------- 逐帧逻辑 ----------
+  function update(now) {
+    if (state !== 'play') return
+    if (phase === 'place') {
+      const m = angleInfo(rd.angle).marker
+      if (Math.hypot(P.x - m.x, P.y - m.y) <= ZONE) {
+        if (!insideSince) insideSince = now
+        if (now - insideSince >= 300) { phase = 'hold'; rd.holdAt = now; audio.note(12, 0.03, 'triangle', 0.03) }
+      } else insideSince = 0
+    } else if (phase === 'hold') {
+      rd.samples.push({ x: P.x, y: P.y })
+      if (now - rd.holdAt >= rd.delay) { phase = 'peek'; rd.peekAt = now }
+    } else if (phase === 'peek') {
+      const t = now - rd.peekAt
+      if (t >= SLIDE + exposure(ri) + RETREAT) { rd.rt = 0; finishRound('slow', now) }
+    } else if (phase === 'after') {
+      if (now - rd.afterAt >= 800) {
+        ri++
+        if (ri >= ROUNDS) end()
+        else newRound()
+      }
+    }
+  }
+
+  // ---------- 绘制 ----------
+  function drawEnemy(now) {
+    if (state !== 'play' || !rd) return
+    let pos, spr
+    if (rd.deadAt) {
+      const age = now - rd.deadAt
+      pos = { ...rd.deadPos, y: rd.deadPos.y + (age < 70 ? 0 : Math.min(10, Math.floor((age - 70) / 30))) }
+      spr = age < 70 ? (pos.face === 'right' ? SPR.flashR : SPR.flashL) : (pos.face === 'right' ? SPR.deadR : SPR.deadL)
+    } else if (phase === 'peek' || (phase === 'after' && rd.peekAt)) {
+      const p = peekP(now - rd.peekAt)
+      if (p <= 0) return
+      pos = enemyPos(rd, p)
+      spr = SPR[pos.face]
+    } else return
+    g.drawImage(spr, pos.x, pos.y)
+  }
+
+  function drawScene(now) {
+    const behindWall = rd && rd.angle !== 'C'
+    g.drawImage(layers.bg, 0, 0)
+    if (behindWall) drawEnemy(now)
+    g.drawImage(layers.wall, 0, 0)
+    if (!behindWall) drawEnemy(now)
+    g.drawImage(layers.crate, 0, 0)
+    // 场景描边
+    g.fillStyle = C.dusk
+    g.fillRect(scene.x - 1, scene.y - 1, scene.w + 2, 1); g.fillRect(scene.x - 1, scene.y + scene.h, scene.w + 2, 1)
+    g.fillRect(scene.x - 1, scene.y, 1, scene.h); g.fillRect(scene.x + scene.w, scene.y, 1, scene.h)
+  }
+
+  function drawMarker(now) {
+    if (state !== 'play' || phase !== 'place') return
+    const m = angleInfo(rd.angle).marker
+    const inside = insideSince > 0
+    if (!inside && !RM && Math.floor(now / 300) % 2) return
+    ring(m.x, m.y, ZONE, C.ink)
+    ring(m.x, m.y, ZONE - 1, inside ? C.lime : C.white)
+    g.fillStyle = inside ? C.lime : C.white
+    g.fillRect(m.x, m.y, 1, 1)
+  }
+
+  const LIFE = { blood: 450, miss: 320 }
+  function drawFx(now) {
+    fx = fx.filter(f => now - f.t < LIFE[f.k])
+    for (const f of fx) {
+      const age = now - f.t, s = age / 1000
+      if (f.k === 'blood') {
+        g.fillStyle = age < 200 ? C.red : C.plum
+        g.fillRect(Math.round(f.x + f.vx * s), Math.round(f.y + f.vy * s + 160 * s * s), 1, 1)
+      } else if (f.k === 'miss') {
+        if (Math.floor(age / 60) % 2) continue
+        g.fillStyle = C.ink
+        g.fillRect(f.x, f.y, 1, 1)
+        g.fillStyle = C.white
+        g.fillRect(f.x - 1, f.y - 1, 1, 1); g.fillRect(f.x + 1, f.y + 1, 1, 1); g.fillRect(f.x + 1, f.y - 1, 1, 1)
+      }
+    }
+  }
+
+  function drawHud() {
+    const y = HY
+    icon('star', 4, y + 4, C.gold)
+    btext(score, 13, y + 5, C.gold)
+    btext(`${Math.min(ri + 1, ROUNDS)}/${ROUNDS}`, Math.floor(S.W / 2), y + 3, C.white, 2, 'center')
+    const last = rounds[rounds.length - 1]
+    icon('clock', S.W - 11, y + 4, C.cyan)
+    btext(last && last.rt && (last.result === 'head' || last.result === 'body') ? last.rt + 'MS' : '--', S.W - 14, y + 5, C.cyan, 1, 'right')
+    // 回合进度点
+    for (let i = 0; i < ROUNDS; i++) {
+      const r = rounds[i]
+      g.fillStyle = !r ? (i === ri ? C.fog : C.dusk) : r.result === 'head' ? C.gold : r.result === 'body' ? C.lime : C.red
+      g.fillRect(Math.floor(S.W / 2) - ROUNDS * 2 + i * 4, y + 16, 3, 2)
+    }
+  }
+
+  function drawPrompt(now) {
+    const y = scene.y + scene.h + 6, cx = Math.floor(S.W / 2)
+    if (P.wantsLock()) { if (RM || Math.floor(now / 500) % 2 === 0) ctext('点击画面锁定鼠标', cx, y, C.lime, { align: 'center' }) }
+    else if (phase === 'place') ctext('把准星移进白圈', cx, y, C.white, { align: 'center' })
+    else if (phase === 'hold' || phase === 'peek') ctext('稳住，等他探头', cx, y, C.fog, { align: 'center' })   // 探头时文字不变，免得成了提示
+    else if (phase === 'after') {
+      const map = {
+        head: ['爆头', C.gold], body: ['命中', C.lime], miss: ['打空了', C.red],
+        slow: ['太慢了', C.fog], early: ['开枪太早', C.orange],
+      }
+      const [txt, col] = map[rd.result]
+      const w = ctext(txt, cx - (rd.rt && rd.result !== 'slow' && rd.result !== 'early' ? 14 : 0), y, col, { align: 'center', shadow: rd.result === 'head' ? C.red : null })
+      if (rd.rt && rd.result !== 'slow' && rd.result !== 'early') btext(rd.rt + 'MS', cx - 14 + Math.ceil(w / 2) + 4, y + 4, C.white)
+    }
+  }
+
+  function drawReady() {
+    const pw = Math.min(S.W - 12, 124), ph = 112, cx = Math.floor(S.W / 2)
+    const px = Math.floor((S.W - pw) / 2), py = Math.max(4, Math.floor((S.H - ph) / 2))
+    const best = json(KEY_BEST)
+    panel(px, py, pw, ph)
+    let y = py + 8
+    ctext('架枪训练', cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
+    y += 22
+    btext('HOLD THE ANGLE', cx, y, C.slate, 1, 'center')
+    y += 10
+    ctext('准星架在点位上稳住', cx, y, C.fog, { align: 'center' })
+    y += 15
+    ctext('敌人一露头立刻开枪', cx, y, C.fog, { align: 'center' })
+    y += 18
+    btext(best ? `BEST ${best.score}` : `${ROUNDS} ROUNDS`, cx, y, C.slate, 1, 'center')
+    btnRect = button(px + 5, py + ph - 23, pw - 10, '开始')
+  }
+
+  function drawOver(now) {
+    const r = result, cx = Math.floor(S.W / 2)
+    const pw = Math.min(S.W - 12, 124), ph = 168
+    const px = Math.floor((S.W - pw) / 2), py = Math.max(4, Math.floor((S.H - ph) / 2))
+    panel(px, py, pw, ph)
+    let y = py + 7
+    ctext('段位', cx, y, C.fog, { align: 'center' })
+    y += 15
+    ctext(r.rank[1], cx, y, C.gold, { align: 'center', size: 16, shadow: C.red })
+    y += 21
+    btext(r.rank[2], cx, y, C.slate, 1, 'center')
+    y += 9
+    btext(r.score, cx, y, C.white, 2, 'center')
+    y += 13
+    if (r.isRec) { if (RM || Math.floor(now / 400) % 2 === 0) ctext('新纪录！', cx, y - 1, C.lime, { align: 'center' }) }
+    else if (r.best) btext(`BEST ${r.best.score}`, cx, y + 3, C.slate, 1, 'center')
+    y += 16
+    const cw = Math.floor((pw - 14) / 2)
+    const stats = [
+      ['平均反应', r.rt ? r.rt + 'MS' : '--'],
+      ['命中', `${r.hits}/${ROUNDS}`],
+      ['爆头率', r.hits ? r.hs + '%' : '--'],
+      ['稳定度', r.stab + '%'],
+    ]
+    stats.forEach(([label, val], i) => {
+      const sx = px + 5 + (i % 2) * (cw + 4), sy = y + Math.floor(i / 2) * 32
+      g.fillStyle = C.dusk; g.fillRect(sx, sy, cw, 29)
+      ctext(label, sx + Math.floor(cw / 2), sy + 2, C.fog, { align: 'center' })
+      btext(val, sx + Math.floor(cw / 2), sy + 17, C.white, String(val).length > 5 ? 1 : 2, 'center')
+    })
+    btnRect = button(px + 5, y + 68, pw - 10, '再来一局')
+  }
+
+  function frame() {
+    const now = performance.now()
+    update(now)
+    g.fillStyle = C.ink
+    g.fillRect(0, 0, S.W, S.H)
+    drawScene(now)
+    drawFx(now)
+    if (state === 'play') { drawHud(); drawMarker(now); drawPrompt(now) }
+    else if (state === 'ready') drawReady()
+    else drawOver(now)
+    if (state !== 'play') muteRect = PK.muteButton(S.W, S.H)
+    exitRect = PK.exitButton(S.H)
+    PK.crosshair(P.x, P.y, now < kickUntil ? 2 : 0)
+    S.present()
+    requestAnimationFrame(frame)
+  }
+
+  if (SLOW) window.__hold = () => ({ state, phase, ri, rd, cross: { x: P.x, y: P.y }, score, door, crate, ground })
+  addEventListener('resize', layout)
+  layout()
+  P.center()
+  requestAnimationFrame(frame)
+})()
+</script>
+</body>
+</html>

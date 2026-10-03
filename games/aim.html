@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>瞄准训练</title>
+<!-- 像素风 Gridshot：5×5 格子里同时亮 3 个小球，点掉一个补一个，30 秒一局。底层工具在 pixelkit.js。 -->
+<style>
+  * { margin:0; padding:0; }
+  html, body { height:100%; background:#1a1c2c; overflow:hidden; user-select:none; -webkit-user-select:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; cursor:none; touch-action:none; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script src="pixelkit.js"></script>
+<script>
+(() => {
+  const { C, RM, B4, store, json, btext, ctext, icon, ring, panel, button, inRect, audio } = PK
+  const DUR = 30          // 一局秒数
+  const GRID = 5          // 格子边长
+  const ACTIVE = 3        // 同时存在的小球数
+  const MISS_COST = 30    // 空枪扣分
+  const KEY_BEST = 'aim-dots-best-v1'
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24]
+
+  const S = PK.screen(document.getElementById('cv'))
+  const g = S.g
+  const P = PK.pointer(S)        // 准星位置；开了灵敏度换算时会锁定鼠标
+  let area = { x: 0, y: 0, s: 0 }, cell = 0, R = 8, HY = 0, stars = []   // HY：HUD 顶边，紧贴在场地上方
+
+  function resize() {
+    S.resize()
+    const hud = 32
+    cell = Math.floor(Math.max(60, Math.min(S.W - 10, S.H - hud - 10)) / GRID)
+    const s = cell * GRID
+    HY = Math.max(0, Math.floor((S.H - hud - s) / 2) - 4)
+    area = { x: Math.floor((S.W - s) / 2), y: HY + hud, s }
+    R = Math.max(4, Math.floor(cell * 0.34))
+    orbCache.clear()
+    stars = PK.starfield(S.W, S.H)
+  }
+
+  const cellCenter = c => ({
+    x: area.x + (c % GRID) * cell + Math.floor(cell / 2),
+    y: area.y + Math.floor(c / GRID) * cell + Math.floor(cell / 2),
+  })
+  const startOrb = () => ({ x: Math.floor(S.W / 2), y: Math.floor(S.H / 2) + 6, r: Math.max(R + 3, 10) })
+
+  // 小球：逐像素算球面明暗，用 Bayer 抖动在色阶之间过渡，左上角一小撮高光
+  const RAMP = [C.plum, C.red, C.orange, C.gold]
+  const orbCache = new Map()
+  function orbSprite(r) {
+    if (orbCache.has(r)) return orbCache.get(r)
+    const d = r * 2 + 1, c = document.createElement('canvas')
+    c.width = c.height = d
+    const x2 = c.getContext('2d')
+    for (let y = 0; y < d; y++) for (let x = 0; x < d; x++) {
+      const dx = x - r, dy = y - r, dist = Math.hypot(dx, dy)
+      if (dist > r + 0.25) continue
+      let col
+      if (dist > r - 0.75) col = C.plum
+      else {
+        const nx = dx / r, ny = dy / r, nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny))
+        const light = Math.max(0, -0.45 * nx - 0.55 * ny + 0.7 * nz)
+        if (Math.hypot(nx + 0.36, ny + 0.4) < (r >= 8 ? 0.2 : 0.3)) col = C.white
+        else col = RAMP[Math.max(0, Math.min(3, Math.floor(0.55 + light * 2.9 + (B4[y & 3][x & 3] / 16 - 0.5) * 0.85)))]
+      }
+      x2.fillStyle = col; x2.fillRect(x, y, 1, 1)
+    }
+    orbCache.set(r, c)
+    return c
+  }
+  const drawOrb = (x, y, r) => g.drawImage(orbSprite(r), x - r, y - r)
+
+  // ---------- 状态 ----------
+  let state = 'ready'           // ready | play | over
+  let t0 = 0, lastHit = 0, score = 0, hits = 0, shots = 0, streak = 0, shakeUntil = 0, kickUntil = 0
+  let rts = [], targets = [], fx = []
+  let result = null, btnRect = null, muteRect = null, exitRect = null
+
+  function spawn(exclude) {
+    const taken = new Set(targets.map(t => t.c))
+    const free = []
+    for (let c = 0; c < GRID * GRID; c++) if (!taken.has(c) && c !== exclude) free.push(c)
+    targets.push({ c: free[Math.floor(Math.random() * free.length)], born: performance.now() })
+  }
+
+  function start() {
+    state = 'play'
+    t0 = lastHit = performance.now()
+    score = hits = shots = streak = 0
+    rts = []; targets = []
+    for (let i = 0; i < ACTIVE; i++) spawn(-1)
+  }
+
+  function end() {
+    state = 'over'
+    targets = []
+    const best = json(KEY_BEST)
+    const acc = shots ? hits / shots : 0
+    const rt = rts.length ? rts.reduce((a, b) => a + b, 0) / rts.length : 0
+    const isRec = score > 0 && (!best || score > best.score)
+    if (isRec) store.set(KEY_BEST, JSON.stringify({ score, acc, rt }))
+    result = { score, acc, rt, hits, kpm: Math.round(hits * 60 / DUR), isRec, best, at: performance.now() }
+    P.unlock()
+    audio.arp([0, 4, 7, 12, 7, 12], 0.07)
+    if (isRec) audio.arp([16, 19, 24], 0.08)
+  }
+
+  // ---------- 输入 ----------
+  P.onDown(({ x, y }) => {
+    audio.unlock()
+    const now = performance.now()
+
+    if (inRect(x, y, exitRect)) { audio.note(0, 0.05); PK.goHome(); return }
+    if (state !== 'play' && inRect(x, y, muteRect)) { audio.toggle(); return }
+    if (state === 'ready') {
+      const b = startOrb()
+      if (Math.hypot(x - b.x, y - b.y) <= b.r + 2) { P.lock(); pop(b.x, b.y, b.r); audio.arp([0, 4, 7, 12], 0.045); start() }
+      return
+    }
+    if (state === 'over') {
+      if (inRect(x, y, btnRect) && now - result.at > 400) { audio.note(7, 0.05); state = 'ready' }
+      return
+    }
+
+    if (P.wantsLock()) { P.lock(); return }   // 中途按 ESC 解锁了：这一下只用来重新锁定，不算开枪
+    shots++
+    kickUntil = now + 70
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i], p = cellCenter(t.c)
+      if (Math.hypot(x - p.x, y - p.y) > R + 1.5) continue
+      const rt = now - Math.max(t.born, lastHit)
+      rts.push(rt); lastHit = now; hits++; streak++
+      const pts = 100 + Math.round(50 * Math.min(1, Math.max(0, (1000 - rt) / 700)))
+      score += pts
+      targets.splice(i, 1)
+      spawn(t.c)
+      pop(p.x, p.y, R)
+      fx.push({ k: 'text', x: p.x, y: p.y - R - 6, text: '+' + pts, t: now })
+      const s = PENTA[Math.min(streak - 1, PENTA.length - 1)]
+      audio.note(s, 0.08)
+      audio.note(s - 12, 0.06, 'triangle', 0.06)
+      return
+    }
+    streak = 0
+    score = Math.max(0, score - MISS_COST)
+    fx.push({ k: 'miss', x: Math.round(x), y: Math.round(y), t: now })
+    if (!RM) shakeUntil = now + 90
+    audio.noise(0.08, 0.06)
+    audio.note(-17, 0.09, 'triangle', 0.08)
+  })
+
+  // ---------- 特效 ----------
+  function pop(x, y, r) {
+    const now = performance.now()
+    fx.push({ k: 'ring', x, y, r, t: now })
+    if (RM) return
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * Math.PI * 2 + Math.random() * 0.5, sp = 40 + Math.random() * 40
+      fx.push({ k: 'px', x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: now })
+    }
+  }
+  const LIFE = { ring: 200, px: 380, text: 650, miss: 300 }
+  function drawFx(now) {
+    fx = fx.filter(f => now - f.t < LIFE[f.k])
+    for (const f of fx) {
+      const age = now - f.t, k = age / LIFE[f.k]
+      if (f.k === 'ring') {
+        const step = Math.min(3, Math.floor(age / 50))
+        ring(f.x, f.y, f.r + 2 + step * 3, [C.white, C.gold, C.orange, C.red][step])
+      } else if (f.k === 'px') {
+        const s = age / 1000 * (1 - k * 0.5), sz = k < 0.4 ? 2 : 1
+        g.fillStyle = k < 0.35 ? C.gold : k < 0.7 ? C.orange : C.red
+        g.fillRect(Math.round(f.x + f.vx * s), Math.round(f.y + f.vy * s), sz, sz)
+      } else if (f.k === 'text') {
+        if (k > 0.75 && Math.floor(age / 50) % 2) continue
+        btext(f.text, f.x, f.y - (RM ? 0 : Math.min(6, Math.floor(age / 60))), C.gold, 1, 'center')
+      } else if (f.k === 'miss') {
+        if (Math.floor(age / 60) % 2) continue
+        g.fillStyle = C.red
+        for (let i = -2; i <= 2; i++) { g.fillRect(f.x + i, f.y + i, 1, 1); g.fillRect(f.x + i, f.y - i, 1, 1) }
+      }
+    }
+  }
+
+  // ---------- 绘制 ----------
+  function drawArena() {
+    const { x, y, s } = area, L = 5
+    g.fillStyle = C.slate
+    for (const [cx, cy, sx, sy] of [[x - 3, y - 3, 1, 1], [x + s + 2, y - 3, -1, 1], [x - 3, y + s + 2, 1, -1], [x + s + 2, y + s + 2, -1, -1]]) {
+      g.fillRect(sx > 0 ? cx : cx - L + 1, cy, L, 1)
+      g.fillRect(cx, sy > 0 ? cy : cy - L + 1, 1, L)
+    }
+    g.fillStyle = C.dusk
+    for (let i = 1; i < GRID; i++) for (let j = 1; j < GRID; j++) g.fillRect(x + i * cell, y + j * cell, 1, 1)
+  }
+
+  function drawHud(now) {
+    const left = Math.max(0, DUR - (now - t0) / 1000), y = HY
+    icon('star', 4, y + 4, C.gold)
+    btext(score, 13, y + 5, C.gold)
+    btext(left.toFixed(1), Math.floor(S.W / 2), y + 3, left < 5 ? C.orange : C.white, 2, 'center')
+    icon('aim', S.W - 11, y + 4, C.cyan)
+    btext(shots ? Math.round(hits / shots * 100) + '%' : '--', S.W - 14, y + 5, C.cyan, 1, 'right')
+    // 分段时间条
+    const segs = Math.floor((S.W - 7) / 4), lit = Math.ceil(segs * left / DUR)
+    const blink = left < 5 && !RM && Math.floor(now / 250) % 2
+    for (let i = 0; i < segs; i++) {
+      g.fillStyle = i < lit ? (left < 5 ? (blink ? C.red : C.orange) : C.cyan) : C.dusk
+      g.fillRect(4 + i * 4, y + 16, 3, 2)
+    }
+    if (streak >= 3) btext('COMBO ' + streak, Math.floor(S.W / 2), y + 21, C.lime, 1, 'center')
+    if (P.wantsLock() && (RM || Math.floor(now / 500) % 2 === 0)) {
+      ctext('点击画面锁定鼠标', Math.floor(S.W / 2), Math.min(S.H - 14, area.y + area.s + 6), C.lime, { align: 'center' })
+    }
+  }
+
+  function drawTargets(now) {
+    for (const t of targets) {
+      const p = cellCenter(t.c), age = now - t.born
+      drawOrb(p.x, p.y, RM || age > 80 ? R : Math.max(2, Math.round(R * (age < 40 ? 0.5 : 0.8))))
+    }
+  }
+
+  function drawReady(now) {
+    const b = startOrb(), cx = b.x, best = json(KEY_BEST)
+    ctext('瞄准训练', cx, b.y - b.r - 40, C.gold, { align: 'center', size: 16, shadow: C.red })
+    btext('AIM TRAINER', cx, b.y - b.r - 14, C.slate, 1, 'center')
+    if (!RM) {
+      const ph = (now % 1200) / 1200
+      if (ph < 0.5) ring(b.x, b.y, b.r + 3 + Math.floor(ph * 10), ph < 0.25 ? C.dusk : C.navy)
+    }
+    drawOrb(b.x, b.y + (RM ? 0 : Math.floor(now / 450) % 2), b.r)
+    if (RM || Math.floor(now / 530) % 2 === 0) ctext('点击开始', cx, b.y + b.r + 8, C.white, { align: 'center' })
+    btext(best ? `BEST ${best.score}` : '30S · 5X5', cx, b.y + b.r + 26, C.fog, 1, 'center')
+  }
+
+  function drawOver(now) {
+    const r = result, cx = Math.floor(S.W / 2)
+    const pw = Math.min(S.W - 12, 124), ph = 152
+    const px = Math.floor((S.W - pw) / 2), py = Math.max(4, Math.floor((S.H - ph) / 2))
+    panel(px, py, pw, ph)
+    let y = py + 7
+    ctext('本局得分', cx, y, C.fog, { align: 'center' })
+    y += 18
+    btext(r.score, cx, y, C.gold, 3, 'center')
+    y += 20
+    if (r.isRec) { if (RM || Math.floor(now / 400) % 2 === 0) ctext('新纪录！', cx, y, C.lime, { align: 'center' }) }
+    else if (r.best) btext(`BEST ${r.best.score}`, cx, y + 4, C.slate, 1, 'center')
+    y += 18
+    const cw = Math.floor((pw - 14) / 2)
+    const stats = [
+      ['命中率', r.acc ? Math.round(r.acc * 100) + '%' : '--'],
+      ['平均反应', !r.rt ? '--' : r.rt < 1000 ? Math.round(r.rt) + 'MS' : (r.rt / 1000).toFixed(2) + 'S'],
+      ['命中', r.hits],
+      ['每分钟', r.kpm],
+    ]
+    stats.forEach(([label, val], i) => {
+      const sx = px + 5 + (i % 2) * (cw + 4), sy = y + Math.floor(i / 2) * 32
+      g.fillStyle = C.dusk; g.fillRect(sx, sy, cw, 29)
+      ctext(label, sx + Math.floor(cw / 2), sy + 2, C.fog, { align: 'center' })
+      btext(val, sx + Math.floor(cw / 2), sy + 17, C.white, String(val).length > 5 ? 1 : 2, 'center')
+    })
+    btnRect = button(px + 5, y + 68, pw - 10, '再来一局')
+  }
+
+  function frame() {
+    const now = performance.now()
+    if (state === 'play' && now - t0 >= DUR * 1000) end()
+
+    g.fillStyle = C.ink
+    g.fillRect(0, 0, S.W, S.H)
+    PK.drawStars(stars, now, state === 'play' ? { x: area.x - 2, y: area.y - 2, w: area.s + 4, h: area.s + 4 } : null)
+    if (state !== 'over') drawArena()
+    if (state === 'play') { drawHud(now); drawTargets(now) }
+    else if (state === 'ready') drawReady(now)
+    drawFx(now)
+    if (state === 'over') drawOver(now)
+    if (state !== 'play') muteRect = PK.muteButton(S.W, S.H)
+    exitRect = PK.exitButton(S.H)
+    PK.crosshair(P.x, P.y, now < kickUntil ? 2 : 0)
+
+    S.present(now < shakeUntil ? (Math.floor(now / 30) % 2 ? 1 : -1) : 0)   // 空枪时整屏抖 1 个美术像素
+    requestAnimationFrame(frame)
+  }
+
+  addEventListener('resize', resize)
+  resize()
+  P.center()
+  requestAnimationFrame(frame)
+})()
+</script>
+</body>
+</html>

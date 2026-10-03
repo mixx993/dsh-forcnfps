@@ -1,0 +1,51 @@
+{
+  "name": "dsh-forcnfps",
+  "version": "0.1.0",
+  "description": "ForCNFps：DeepSeek Harness 右侧栏里的像素风 FPS 练手小游戏（舒尔特斩 / 瞄准训练 / CS 架枪训练），支持按 CS2、瓦罗兰特灵敏度换算",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "fps",
+    "aim-trainer",
+    "cs2",
+    "valorant",
+    "schulte",
+    "game"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "author": "mixx993",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mixx993/dsh-forcnfps.git"
+  },
+  "homepage": "https://github.com/mixx993/dsh-forcnfps#readme"
+}
